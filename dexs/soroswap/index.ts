@@ -12,16 +12,19 @@ const fetch = async (options: FetchOptions) => {
   const dailyVolume = options.createBalances();
 
   // Swap events come from every SoroswapPair contract (topics ["SoroswapPair", "swap"]).
-  // stellar.history_contract_events stores some contract events twice (with and without
-  // operation_id), so events are deduplicated on their XDR within each transaction.
+  // stellar.history_contract_events stores every contract event twice, once with
+  // operation_id and once with it null. Only the copy with operation_id is kept, and events
+  // are deduplicated on (transaction, operation, XDR) so two identical swaps in different
+  // operations of one transaction both count.
   // A pair's token_0/token_1 are read from its instance storage (keys 0 and 1), which is
   // rewritten on every swap because reserves live there too, so the same day partition has
   // it. Key 4 must be the Soroswap factory, which drops contracts that only mimic the topic.
   const query = `
     WITH events AS (
-      SELECT DISTINCT transaction_hash, contract_id, contract_event_xdr, data_decoded
+      SELECT DISTINCT transaction_hash, operation_id, contract_id, contract_event_xdr, data_decoded
       FROM stellar.history_contract_events
       WHERE closed_at_date = DATE '${options.dateString}'
+        AND operation_id IS NOT NULL
         AND type_string = 'ContractEventTypeContract'
         AND successful = true
         AND in_successful_contract_call = true
