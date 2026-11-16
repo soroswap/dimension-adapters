@@ -32,7 +32,8 @@ const addAmount = (
   if (!assetId) return;
 
   if (assetId === ADA_ID) {
-    balanceObj.addGasToken(quantity, label);
+    // not addGasToken: its key (cardano:0x000...) has no price before 2023-03-21, cardano:lovelace does
+    balanceObj.addToken("lovelace", quantity, label);
   } else {
     balanceObj.addToken(formatAsset(assetId), quantity, label);
   }
@@ -75,6 +76,8 @@ export const getFetch = (versions: SundaeVersion[]) => async (options: FetchOpti
   const allPools = data?.pools?.popular;
   if (!allPools?.length) throw new Error("Sundae API returned no pools");
   const pools = allPools.filter((pool: any) => versions.includes(pool.version));
+  if (!pools.length)
+    throw new Error(`Sundae API returned none of ${versions.join(", ")} among its ${allPools.length} listed pools`);
 
   for (const pool of pools) {
     for (const tick of pool.ticks?.rich ?? []) {
@@ -168,6 +171,8 @@ export const getVolumeFetch = (versions: SundaeVersion[]) => async (options: Fet
   const allPools = data?.pools?.popular;
   if (!allPools?.length) throw new Error("Sundae API returned no pools");
   const pools = allPools.filter((pool: any) => versions.includes(pool.version));
+  if (!pools.length)
+    throw new Error(`Sundae API returned none of ${versions.join(", ")} among its ${allPools.length} listed pools`);
 
   for (const pool of pools) {
     for (const tick of pool.ticks?.rich ?? []) {

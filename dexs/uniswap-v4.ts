@@ -1,3 +1,6 @@
+// Changes to this adapter's revenue methodology require further approval before merging:
+// a Trueo market depends on this data.
+
 // import { FetchOptions, SimpleAdapter } from "../adapters/types";
 // import { httpGet } from "../utils/fetchURL";
 
@@ -210,6 +213,12 @@ const Configs: Record<string, IUniswapConfig> = {
     positionManager: '0x6049c9a0e26405c0985f9e3685c87d0ae917f82b',
     source: 'LOGS',
     start: '2026-05-28',
+  },
+  [CHAIN.ELYSIUM]: {
+    poolManager: '0xE2e105d3F7209A9DA11f83cCf3E7398a753823F1',
+    positionManager: '0x1d1C51b9d07fD27d36412A2b66CC23D19Eb3E518',
+    source: 'LOGS',
+    start: '2026-11-03',
   },
 }
 

@@ -3,11 +3,18 @@ import { CHAIN } from '../../helpers/chains';
 import fetchURL from '../../utils/fetchURL';
 import { dailyResponse } from './accounting';
 import { managedVaults } from './deployments';
+import { vaultFees } from './vaults';
 
 const SWAP_FEES = 'Vault Liquidity Fees';
 const OPERATIONS = 'Vault Fees To Operations';
 const BUYBACK_RESERVE = 'Vault Fees To Buyback Reserve';
 const DEPOSITORS = 'Vault Fees To Depositors';
+// Gauge rewards (UP on Up, RAM on Ramses, FABLES on Fables) earned by the vaults that replaced V7, which charge the same
+// fee shares on them
+const REWARDS = 'Vault Gauge Rewards';
+const REWARDS_OPERATIONS = 'Vault Gauge Rewards To Operations';
+const REWARDS_BUYBACK_RESERVE = 'Vault Gauge Rewards To Buyback Reserve';
+const REWARDS_DEPOSITORS = 'Vault Gauge Rewards To Depositors';
 
 /** Convert validated daily native-token earnings into fee and revenue balances. */
 const fetch = async (options: FetchOptions) => {
@@ -42,13 +49,28 @@ const fetch = async (options: FetchOptions) => {
       dailySupplySideRevenue.add(token, earned - operations - buyback, DEPOSITORS);
     }
   });
+  // Vaults that replaced V7, read on-chain: each vault's protocolFeeBps (10%) and buybackFeeBps (20%), on trading fees
+  // and gauge rewards alike
+  for (const { source, token, earned, operations, buyback } of await vaultFees(options)) {
+    const [fees, toOperations, toBuyback, toDepositors] = source === 'rewards'
+      ? [REWARDS, REWARDS_OPERATIONS, REWARDS_BUYBACK_RESERVE, REWARDS_DEPOSITORS]
+      : [SWAP_FEES, OPERATIONS, BUYBACK_RESERVE, DEPOSITORS];
+    dailyFees.add(token, earned, fees);
+    dailyRevenue.add(token, operations, toOperations);
+    dailyRevenue.add(token, buyback, toBuyback);
+    dailyProtocolRevenue.add(token, operations, toOperations);
+    dailyHoldersRevenue.add(token, buyback, toBuyback);
+    dailySupplySideRevenue.add(token, earned - operations - buyback, toDepositors);
+  }
   return { dailyFees, dailyRevenue, dailyProtocolRevenue, dailyHoldersRevenue, dailySupplySideRevenue };
 };
 const protocolBreakdown = {
   [OPERATIONS]: 'The operations allocation of earned vault LP fees (10%).',
+  [REWARDS_OPERATIONS]: 'The operations allocation of earned vault gauge rewards (10%).',
 };
 const holdersBreakdown = {
   [BUYBACK_RESERVE]: 'The allocation reserved for future SPRING buybacks and burns (20%), measured when fees accrue rather than when the buyback executes.',
+  [REWARDS_BUYBACK_RESERVE]: 'The allocation of earned vault gauge rewards reserved for future SPRING buybacks and burns (20%), measured when the rewards accrue rather than when the buyback executes.',
 };
 const revenueBreakdown = { ...protocolBreakdown, ...holdersBreakdown };
 const adapter: SimpleAdapter = {
@@ -59,16 +81,22 @@ const adapter: SimpleAdapter = {
   // Cumulative allocation floors may also produce raw-unit revenue/supplier negatives.
   allowNegativeValue: true,
   methodology: {
-    Fees: 'LP fees earned by the listed TickerSpring V7 vaults during the UTC day, including uncollected fees. Measured as the change in cumulative harvested plus pending native-token fees from saved on-chain observations. Excludes principal, stock-price returns, retired vaults and lending.',
-    Revenue: 'Earned vault LP fees allocated to operations (10%) and the SPRING buyback reserve (20%), subject to raw-token rounding.',
-    ProtocolRevenue: 'The operations allocation of earned vault LP fees (10%).',
-    HoldersRevenue: 'The allocation reserved to buy and permanently burn SPRING (20%), measured when vault fees accrue rather than when the buyback executes.',
-    SupplySideRevenue: 'Earned LP fees retained for vault depositors after protocol allocations (approximately 70%).',
+    Fees: 'LP fees and gauge rewards earned by the TickerSpring vaults during the UTC day, including amounts not yet collected. V7 vaults: the change in cumulative harvested plus pending native-token fees from saved on-chain observations. Vaults that replaced V7 (listed by https://api.tickerspring.com/v1/merged/vaults): the trading fees and gauge rewards (UP on Up, RAM on Ramses, FABLES on Fables) their Harvest events collected plus the change in uncollected position fees and unclaimed rewards, read on-chain at the day\'s first and last blocks. Excludes principal, stock-price returns, retired vaults and lending.',
+    Revenue: 'Earned vault LP fees and gauge rewards allocated to operations (10%) and the SPRING buyback reserve (20%), subject to raw-token rounding.',
+    ProtocolRevenue: 'The operations allocation (10%) of earned vault LP fees and gauge rewards.',
+    HoldersRevenue: 'The allocation of earned vault LP fees and gauge rewards reserved to buy and permanently burn SPRING (20%), measured when they accrue rather than when the buyback executes.',
+    SupplySideRevenue: 'Earned LP fees and gauge rewards retained for vault depositors after protocol allocations (approximately 70%).',
   },
   breakdownMethodology: {
-    Fees: { [SWAP_FEES]: 'Daily change in grossFees plus position.pendingFees, in each underlying token, from the public daily history API. Harvesting moves fees between these counters without counting them twice. Missing observations fail instead of returning zero.' },
+    Fees: {
+      [SWAP_FEES]: 'V7 vaults: daily change in grossFees plus position.pendingFees, in each underlying token, from the public daily history API; missing observations fail instead of returning zero. Vaults that replaced V7: USDG and pool-token fees from Harvest events plus the change in the venue position\'s uncollected fees (fee growth inside its range on Uniswap V3, Up and Ramses; the PoolManager position on Uniswap V4). Fables venues stake all their liquidity, so they earn FABLES instead of trading fees. Harvesting moves fees between these counters without counting them twice.',
+      [REWARDS]: 'Gauge rewards earned by the positions of the vaults that replaced V7: UP on Up (a staked position earns UP instead of trading fees), RAM on Ramses and FABLES on Fables (the venue stakes all its liquidity in the Fables hook, whose staked shares give their trading fees to Fables voters and earn FABLES). The rewards their Harvest events claimed plus the change in rewards not yet claimed (the Up gauge\'s earned() for the staked position; the Ramses venue\'s pendingRewards(); the FABLES the Fables venue holds, counted once claimed to it from the Fables emission stream). The vaults charge the same fee shares on rewards as on trading fees; V7 and Uniswap vaults earn none.',
+    },
     Revenue: revenueBreakdown, ProtocolRevenue: protocolBreakdown, HoldersRevenue: holdersBreakdown,
-    SupplySideRevenue: { [DEPOSITORS]: 'Earned vault LP fees minus the accrued operations and buyback-reserve allocations.' },
+    SupplySideRevenue: {
+      [DEPOSITORS]: 'Earned vault LP fees minus the accrued operations and buyback-reserve allocations.',
+      [REWARDS_DEPOSITORS]: 'Earned vault gauge rewards minus the accrued operations and buyback-reserve allocations.',
+    },
   },
 };
 export default adapter;

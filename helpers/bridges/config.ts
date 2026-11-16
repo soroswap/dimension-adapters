@@ -138,9 +138,10 @@ const synapseRfqEvents = (targets: string[]): BridgeEvent[] => [
   { eventAbi: "event BridgeRelayed(bytes32 indexed transactionId, address indexed relayer, address indexed to, uint32 originChainId, address originToken, address destToken, uint256 originAmount, uint256 destAmount, uint256 chainGasAmount)", targets, direction: "incoming", tokenArg: "destToken", amountArg: "destAmount" },
 ];
 
-export const synapseBridge = (contracts: { bridge: string; rfq?: string }, start?: string): BridgeChainConfig => ({
+// Linea and Scroll only have the FastBridge, no SynapseBridge
+export const synapseBridge = (contracts: { bridge?: string; rfq?: string }, start?: string): BridgeChainConfig => ({
   start,
-  events: [...synapseBridgeEvents([contracts.bridge]), ...(contracts.rfq ? synapseRfqEvents([contracts.rfq]) : [])],
+  events: [...(contracts.bridge ? synapseBridgeEvents([contracts.bridge]) : []), ...(contracts.rfq ? synapseRfqEvents([contracts.rfq]) : [])],
 });
 
 // ---------------------------------------------------------------------------------------------------
@@ -299,6 +300,20 @@ export const polygonPosBridge = (start?: string): BridgeChainConfig => {
 };
 
 // ---------------------------------------------------------------------------------------------------
+// Alcor Bridge: lock/mint between EVM chains and Antelope, with Telos as the hub. One AlcorVault per EVM
+// chain locks every asset (the zero address is the native coin); Telos light clients prove deposits there,
+// and the vault releases withdrawals once Telos is proved back to it. Released `amount` is what the
+// recipient gets, `fee` goes to whoever delivered the proof. https://telos.alcor.exchange/api/bridge/docs/bot
+// ---------------------------------------------------------------------------------------------------
+export const alcorBridge = (vault: string, start?: string): BridgeChainConfig => ({
+  start,
+  events: [
+    { eventAbi: "event Deposit(address indexed token, address indexed from, uint256 amount, uint64 canonical, uint64 telosTo, uint64 nonce, address refundTo, uint64 fillFee, uint64 filler, bytes memo)", targets: [vault], direction: "outgoing", tokenArg: "token", amountArg: "amount" },
+    { eventAbi: "event Released(uint64 indexed id, address indexed token, address indexed to, uint256 amount, address feeTo, uint256 fee)", targets: [vault], direction: "incoming", tokenArg: "token", amountArg: "amount" },
+  ],
+});
+
+// ---------------------------------------------------------------------------------------------------
 // Allbridge Classic: lock/burn deposits arrive as transfers into the bridge, unlocks/mints emit Received.
 // Same bridge address on every chain. https://docs-classic.allbridge.io
 // ---------------------------------------------------------------------------------------------------
@@ -438,6 +453,30 @@ export const thresholdTbtcBridge = (start?: string): BridgeChainConfig => {
   };
 };
 
+// Coinbase wrapped assets: FiatTokenV2_1 contracts that Coinbase mints when the native asset
+// is deposited into its custody and burns on redemption.
+export const coinbaseWrappedBridge = (token: string, start?: string): BridgeChainConfig => ({
+  start,
+  events: [
+    { eventAbi: "event Burn(address indexed burner, uint256 amount)", targets: [token], direction: "outgoing", fixedToken: token, amountArg: "amount" },
+    { eventAbi: "event Mint(address indexed minter, address indexed to, uint256 amount)", targets: [token], direction: "incoming", fixedToken: token, amountArg: "amount" },
+  ],
+});
+
+// WBTC: the Factory confirms merchant mints (BTC locked with the custodian) and burns (BTC released).
+// Same events as fees/wbtc. https://wbtc.network
+export const wbtcBridge = (start?: string): BridgeChainConfig => {
+  const factory = ["0xe5A5F138005E19A3E6D0FE68b039397EeEf2322b"];
+  const wbtc = ADDRESSES.ethereum.WBTC;
+  return {
+    start,
+    events: [
+      { eventAbi: "event BurnConfirmed(uint256 indexed nonce, address indexed requester, uint256 amount, string btcDepositAddress, string btcTxid, uint256 timestamp, bytes32 inputRequestHash)", targets: factory, direction: "outgoing", fixedToken: wbtc, amountArg: "amount" },
+      { eventAbi: "event MintConfirmed(uint256 indexed nonce, address indexed requester, uint256 amount, string btcDepositAddress, string btcTxid, uint256 timestamp, bytes32 requestHash)", targets: factory, direction: "incoming", fixedToken: wbtc, amountArg: "amount" },
+    ],
+  };
+};
+
 // ---------------------------------------------------------------------------------------------------
 // Asset Chain bridge, Asset Chain side: one bridge contract per bridged asset. SentTokens leaves Asset
 // Chain, FulfilledTokens delivers an inbound transfer. https://docs.assetchain.org
@@ -528,14 +567,18 @@ export const zkBridge = (contracts: [string, Record<number, string>][], start?: 
 // ---------------------------------------------------------------------------------------------------
 // XY Finance: yBridge (SwapRequested out, SwappedForUser in) and XYRouter requests routed through other
 // bridges (yBridge-routed requests are skipped, its own events count them). Native is 0xEeee...EEeE.
+// yBridge was upgraded on 2024-12-09 and SwapRequested gained an address after _swapId (new topic0), so both
+// versions are read. XY sunset its services on 2025-10-17; the last yBridge flows (wind-down) are on 2025-11-26.
 // https://docs.xy.finance/smart-contract/addresses
 // ---------------------------------------------------------------------------------------------------
 const XY_NATIVE = { [ADDRESSES.GAS_TOKEN_2]: ADDRESSES.null };
 export const xyBridge = (contracts: { yBridge: string; router: string }, start?: string): BridgeChainConfig => ({
   start,
+  deadFrom: "2025-11-27",
   events: [
     { eventAbi: "event XYRouterRequested(uint256 xyRouterRequestId, address indexed sender, address srcToken, uint256 amountIn, address indexed bridgeAddress, address bridgeToken, uint256 bridgeAmount, uint256 dstChainId, bytes bridgeAssetReceiver, ((bool hasTip, address tipReceiver) tipInfo, (bool hasDstChainSwap, ((address srcToken, address dstToken, uint256 minReturnAmount, address receiver) swapRequest, address dexAddress, address approveToAddress, bytes dexCalldata) swapAction) dstChainSwapInfo, (bool hasIM, address xApp, address refundReceiver, bytes message) imInfo) dstChainAction, address indexed affiliate)", targets: [contracts.router], direction: "outgoing", tokenArg: "bridgeToken", amountArg: "bridgeAmount", mapTokens: XY_NATIVE, filter: (args: any) => String(args.bridgeAddress).toLowerCase() !== contracts.yBridge.toLowerCase() },
     { eventAbi: "event SwapRequested(uint256 _swapId, address indexed _aggregatorAdaptor, (uint32 dstChainId, address dstChainToken, address dstAggregatorAdaptor, uint256 expectedDstChainTokenAmount, uint32 slippage) _dstChainDesc, address _srcToken, address indexed _vaultToken, uint256 _vaultTokenAmount, address _receiver, uint256 _srcTokenAmount, uint256 _expressFeeAmount, address indexed _referrer)", targets: [contracts.yBridge], direction: "outgoing", tokenArg: "_vaultToken", amountArg: "_vaultTokenAmount", mapTokens: XY_NATIVE },
+    { eventAbi: "event SwapRequested(uint256 _swapId, address indexed _aggregatorAdaptor, address _caller, (uint32 dstChainId, address dstChainToken, address dstAggregatorAdaptor, uint256 expectedDstChainTokenAmount, uint32 slippage) _dstChainDesc, address _srcToken, address indexed _vaultToken, uint256 _vaultTokenAmount, address _receiver, uint256 _srcTokenAmount, uint256 _expressFeeAmount, address indexed _referrer)", targets: [contracts.yBridge], direction: "outgoing", tokenArg: "_vaultToken", amountArg: "_vaultTokenAmount", mapTokens: XY_NATIVE },
     { eventAbi: "event SwappedForUser(address indexed _aggregatorAdaptor, address indexed _srcToken, uint256 _srcTokenAmount, address _dstToken, uint256 _dstTokenAmountOut, address _receiver)", targets: [contracts.yBridge], direction: "incoming", tokenArg: "_dstToken", amountArg: "_dstTokenAmountOut", mapTokens: XY_NATIVE },
   ],
 });

@@ -6,6 +6,7 @@ import { METRIC } from '../../helpers/metrics';
 import { CHAIN } from '../../helpers/chains';
 import { createFactoryExports } from '../../factory/registry';
 import { cache } from "@defillama/sdk";
+import { collectNamedSymbols, parseStuckReserveSymbols } from '../insolventMarkets';
 
 export interface AaveLendingPoolConfig {
   version: 1 | 2 | 3;
@@ -39,28 +40,7 @@ const MAX_REASONABLE_SUPPLY_APR = 10; // 1000% APR
 const HIGH_RESERVE_FACTOR = 0.99;
 const FULL_UTILIZATION = 0.99;
 
-// The stuck-markets cache records one entry per pool, whose value names the
-// offending reserves in a fixed shape: "SYMBOL: reason", several of them joined
-// by " | ". Every one of the 41 entries in the cache follows it, including
-// awkward ones like "SolvBTC.b", "USDC.e", "oUSDC", "WETH/USDT WLP" and
-// "T-2250_2750-WETH-USDC", none of which contain a colon or a pipe.
-//
-// Returns an empty array for anything it cannot read, which the caller treats as
-// "drop the whole pool", i.e. the behaviour before reserve-level filtering.
-export function parseStuckReserveSymbols(reason: unknown): Array<string> {
-  if (typeof reason !== 'string' || !reason.trim()) return []
-  const symbols = reason
-    .split('|')
-    .map(segment => {
-      const separator = segment.indexOf(':')
-      return separator === -1 ? '' : segment.slice(0, separator).trim()
-    })
-    .filter(Boolean)
-  // A partially parseable reason is not good enough: one unreadable segment
-  // would let its reserve through. Treat the whole thing as unreadable.
-  if (symbols.length !== reason.split('|').length) return []
-  return [...new Set(symbols)]
-}
+export { parseStuckReserveSymbols };
 
 export async function getPoolFees(pool: AaveLendingPoolConfig, options: FetchOptions, balances: {
   dailyFees: sdk.Balances,
@@ -216,8 +196,15 @@ export async function getPoolFees(pool: AaveLendingPoolConfig, options: FetchOpt
 
       const windowSeconds = options.toTimestamp - options.fromTimestamp
 
+      // The stored liquidityIndex only moves when the reserve is touched, so the growth we read spans the
+      // time between the two lastUpdateTimestamps, not the run window. Annualize over that span, otherwise
+      // an hourly window in which an idle reserve catches up on days of interest looks like a 1000%+ APR
+      // and the sanity guard below drops real interest (hourly runs undercounted lendle by ~40%).
+      const accrualSeconds = Number(reserveDataAfter[reserveIndex].lastUpdateTimestamp ?? 0) - Number(reserveDataBefore[reserveIndex].lastUpdateTimestamp ?? 0)
+      const annualizeSeconds = accrualSeconds > 0 ? accrualSeconds : windowSeconds
+
       const periodSupplyRate = Number(growthLiquidityIndex) / Number(reserveLiquidityIndexBefore)
-      const annualizedSupplyRate = windowSeconds > 0? periodSupplyRate * SECONDS_PER_YEAR / windowSeconds : periodSupplyRate
+      const annualizedSupplyRate = annualizeSeconds > 0 ? periodSupplyRate * SECONDS_PER_YEAR / annualizeSeconds : periodSupplyRate
       if (annualizedSupplyRate > MAX_REASONABLE_SUPPLY_APR) continue
 
       const supplySideInterestAccrued = totalLiquidity * growthLiquidityIndex / reserveLiquidityIndexBefore
@@ -357,19 +344,14 @@ export function aaveExport(exportConfig: {[key: string]: AaveAdapterExportConfig
 
         for (const pool of config.pools) {
           const poolAddress = pool.lendingPoolProxy.toLowerCase();
-          const skipped = new Set<string>();
 
           // Both lists name their offending reserves in the same "SYMBOL: reason" shape, so drop
           // those reserves and keep the rest of the pool. A reason we cannot read still drops the
           // whole pool, which is what both lists did before.
-          for (const reason of [insolventReasons[poolAddress], stuckReasons[poolAddress]]) {
-            if (reason === undefined) continue;
-            const symbols = parseStuckReserveSymbols(reason);
-            if (!symbols.length) { skipped.clear(); break; }
-            symbols.forEach(symbol => skipped.add(symbol));
-          }
-          if ((poolAddress in insolventReasons || poolAddress in stuckReasons) && !skipped.size) continue;
-          const skipReserveSymbols = skipped.size ? [...skipped] : undefined;
+          const listed = poolAddress in insolventReasons || poolAddress in stuckReasons;
+          const namedSymbols = collectNamedSymbols([insolventReasons[poolAddress], stuckReasons[poolAddress]]);
+          if (listed && !namedSymbols?.length) continue;
+          const skipReserveSymbols = namedSymbols?.length ? namedSymbols : undefined;
 
           await getPoolFees(pool, options, {
             dailyFees,
@@ -429,10 +411,24 @@ const aaveV1V2BreakdownMethodology = {
 }
 
 function aaveAdapter(config: {[key: string]: AaveAdapterExportConfig}, global?: Partial<SimpleAdapter>): SimpleAdapter {
-  return { version: 2, adapter: aaveExport(config), ...global };
+  return { version: 2, pullHourly: true, adapter: aaveExport(config), ...global };
 }
 
 export const aaveProtocolConfigs: Record<string, { config: {[key: string]: AaveAdapterExportConfig}, global?: Partial<SimpleAdapter> }> = {
+  // Aave V3 pool and data provider: https://kittypunch.gitbook.io/kittypunch-docs/protocols-and-products-abstract/kona-lend
+  // Pool creation: https://abscan.org/tx/0x0b4de9b171e88900a701de525520bf4fb1ed120417c5d3441cd104ee3a6aeed7
+  'kittypunch-kona-lend': {
+    config: {
+      [CHAIN.ABSTRACT]: {
+        start: '2025-12-10',
+        pools: [{
+          version: 3,
+          lendingPoolProxy: '0x8f16B5713F412C5dE4951Aaf678Eb8409101f819',
+          dataProvider: '0xDfc422c8793864ecD12Bc59F2024614034BcB078',
+        }],
+      },
+    },
+  },
   'aave-v1': {
     config: {
       [CHAIN.ETHEREUM]: {
@@ -744,11 +740,6 @@ export const aaveProtocolConfigs: Record<string, { config: {[key: string]: AaveA
             version: 3,
             lendingPoolProxy: '0xC486115C7db399F0e080A3713BF01B65CC8A5b64',
             dataProvider: '0x898D0EF6E20B7597728AEB41169c22608Fe4b234',
-          },
-          {
-            version: 3,
-            lendingPoolProxy: '0xeD6d6d18F20f8b419B5442C43D3e48EE568dEc14',
-            dataProvider: '0x4c25c261Fe47bC216113D140BaF72B05E151bcE4',
           },
         ],
       },
@@ -1475,6 +1466,52 @@ export const aaveProtocolConfigs: Record<string, { config: {[key: string]: AaveA
             dataProvider: '0xD95D42BAd744821af78da755C6fC012f10ad1824',
           },
         ],
+      },
+    },
+  },
+  // RNT Lend: Reental's Aave V3 fork, borrow USDT0/USDC against Reental property tokens
+  'rnt-lend': {
+    config: {
+      [CHAIN.POLYGON]: {
+        start: '2024-10-30', // pool proxy created in block 63679510, tx 0x30a6c77d72229baf4a26a575d5d2c1f66ea2494cb065c847d2067dd1f9b29f58
+        pools: [
+          {
+            version: 3,
+            lendingPoolProxy: '0x67dC8037Db6309Dd5571D82c65F5f593F7da1505', // returned by PoolAddressesProvider 0x717c2a6fa0820b04b9d4793daca33a229aec85ca getPool()
+            // Source: https://github.com/DefiLlama/DefiLlama-Adapters/blob/main/projects/rnt-lend/index.js
+            dataProvider: '0x5542ac41138f6a52a13c644f1db56bada71a4021',
+          },
+        ],
+      },
+    },
+    global: {
+      pullHourly: true,
+      methodology: {
+        Fees: 'Estimated borrowing fees, including supplier flashloan earnings, plus liquidation bonuses and the separately recorded protocol share of flashloan premiums; unpriced collateral bonuses are excluded from USD totals.',
+        Revenue: 'Estimated reserve-factor share of borrowing fees, plus the protocol shares of liquidation bonuses and flashloan premiums; unpriced collateral bonuses are excluded from USD totals.',
+        SupplySideRevenue: 'Liquidity-index earnings for suppliers, including their flashloan premiums, and liquidation bonuses retained by liquidators; unpriced collateral bonuses are excluded from USD totals.',
+        ProtocolRevenue: 'Estimated reserve-factor share of borrowing fees and the protocol shares of liquidation bonuses and flashloan premiums; unpriced collateral bonuses are excluded from USD totals.',
+      },
+      breakdownMethodology: {
+        Fees: {
+          [METRIC.BORROW_INTEREST]: 'Opening aToken supply multiplied by relative liquidity-index growth, grossed up by the opening reserve factor; includes supplier flashloan earnings.',
+          [METRIC.LIQUIDATION_FEES]: 'Liquidation bonuses, paid in the seized collateral. Reental property tokens have no market price, so bonuses paid in them are not valued.',
+          [METRIC.FLASHLOAN_FEES]: 'Protocol share of flashloan premiums. The suppliers\' share accrues to the liquidity index and is already counted in borrow interest.',
+        },
+        Revenue: {
+          [METRIC.BORROW_INTEREST]: 'Estimated interest less supplier index earnings, using the reserve factor at the start of the window.',
+          [METRIC.LIQUIDATION_FEES]: 'Liquidation protocol fee share of liquidation bonuses.',
+          [METRIC.FLASHLOAN_FEES]: 'Protocol share of flashloan premiums.',
+        },
+        SupplySideRevenue: {
+          [METRIC.BORROW_INTEREST]: 'Opening aToken supply multiplied by relative liquidity-index growth, including supplier flashloan earnings.',
+          [METRIC.LIQUIDATION_FEES]: 'Liquidation bonuses kept by liquidators.',
+        },
+        ProtocolRevenue: {
+          [METRIC.BORROW_INTEREST]: 'Reserve factor share of borrow interest kept by the RNT Lend treasury.',
+          [METRIC.LIQUIDATION_FEES]: 'Liquidation protocol fee share kept by the RNT Lend treasury.',
+          [METRIC.FLASHLOAN_FEES]: 'Protocol share of flashloan premiums kept by the RNT Lend treasury.',
+        },
       },
     },
   },

@@ -2,6 +2,7 @@ import ADDRESSES from '../helpers/coreAssets.json'
 import { Dependencies, FetchOptions, SimpleAdapter } from '../adapters/types';
 import { CHAIN } from '../helpers/chains';
 import { queryDuneSql } from '../helpers/dune';
+import { assertDuneSolanaIndexed } from '../helpers/duneSolanaDex';
 import { METRIC } from '../helpers/metrics';
 
 // Meteora DLMM fees and revenue. Volume is in dexs/meteora-dlmm.ts.
@@ -16,11 +17,13 @@ const DLMM_PROGRAM = 'LBUZKhRxPF3XUpBCjp4YzTKgLccjZhTSDM9YuVaPwxo';
 // Counted when claimed. All claims are holders revenue: referral rewards only go to wallets that stake MET
 // themselves (200 MET minimum), and the split is not on-chain anyway.
 // The distributor program is a shared deployment (same upgrade authority as Jupiter's), so claims are scoped to
-// the cycle distributor accounts funded by the wallet above; a new cycle adds one entry here.
+// the cycle distributor accounts; a new cycle adds one entry here. All cycles share the distributor admin
+// B2tKdjH11kLTqEJAzN8qGfVXmLnwgbxWgjAkXr2ehUgN and clawback receiver KVdHwixX5cSyhcrx3Lti7oYHwAxBgwNY7FrkX1oT2Hy.
 const MERKLE_DISTRIBUTOR_PROGRAM = 'DiSLRwcSFvtwvMWSs7ubBMvYRaYNYupa76ZSuYLe6D7j';
 const REFERRAL_STAKING_DISTRIBUTORS = [
   'F8V2kory4zDQ7a1eRp4PEiuXeqC94hbHqcekHDwpdYrz', // cycle 1 (2026-07-21 to 2026-08-21), funded 2026-09-10
   'ETZXpSBB22C3vTt923c31rNYweVd3LAnkjEmgQwZQAw5', // cycle 2 (2026-08-21 to 2026-09-21), funded 2026-09-23
+  'BBZ2yjFEePF6fxtwX2qwLmqS7FodZHjR5WScrWgLh9p9',
 ];
 // USDC paid out by an unlisted distributor above this is either a new cycle (add it) or another project's drop
 const UNLISTED_DISTRIBUTOR_ALERT_USDC = 1_000;
@@ -154,6 +157,8 @@ GROUP BY 1
 `;
 
 const fetch = async (options: FetchOptions) => {
+  assertDuneSolanaIndexed(options);
+
   const rows: FeeRow[] = await queryDuneSql(options, getFeesQuery(options), { extraUIDKey: 'dlmm-fees' });
   if (!rows.length) throw new Error('meteora-dlmm fees: Dune returned no swaps for the window');
 

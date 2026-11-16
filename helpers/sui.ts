@@ -11,6 +11,14 @@ export async function getObject(objectId: string): Promise<any> {
   return sui.getObject({ objectId })
 }
 
+export async function graphqlCall(query: string, variables: Record<string, any> = {}): Promise<any> {
+  return sui.graphqlCall({ query, variables })
+}
+
+export async function getCheckpointAtTimestamp(timestamp: number): Promise<{ sequenceNumber: number; timestamp: number }> {
+  return sui.getCheckpointAtTimestamp({ timestamp })
+}
+
 export interface SuiEventModule {
   package: string
   module: string
@@ -33,6 +41,50 @@ export async function queryEvents<T = any>({ eventType, eventModule, options, tr
     endTimestamp: options.endTimestamp,
     transform,
   })
+}
+
+const checkpointsBeforeWindow: Record<number, Promise<{ sequenceNumber: number; timestamp: number }>> = {}
+
+export function getCheckpointBeforeWindow(startTimestamp: number): Promise<{ sequenceNumber: number; timestamp: number }> {
+  return checkpointsBeforeWindow[startTimestamp] ??= getCheckpointAtTimestamp(startTimestamp - 1)
+}
+
+export async function queryEventsInWindow(eventType: string, options: { startTimestamp: number; endTimestamp: number }): Promise<any[]> {
+  return (await queryEventNodesInWindow(eventType, options)).map((e) => e.json)
+}
+
+export async function queryEventNodesInWindow(eventType: string, options: { startTimestamp: number; endTimestamp: number }): Promise<{ json: any; digest: string }[]> {
+  const { sequenceNumber } = await getCheckpointBeforeWindow(options.startTimestamp)
+  const events: { json: any; digest: string }[] = []
+  let after: string | null = null
+  while (true) {
+    const { events: page } = await graphqlCall(`query ($after: String) {
+      events(first: 50, after: $after, filter: { type: "${eventType}", afterCheckpoint: ${sequenceNumber} }) {
+        pageInfo { hasNextPage endCursor }
+        nodes { timestamp contents { json } transaction { digest } }
+      }
+    }`, { after })
+    for (const node of page.nodes) {
+      const ts = Date.parse(node.timestamp) / 1e3
+      if (ts >= options.endTimestamp) return events
+      if (ts >= options.startTimestamp) events.push({ json: node.contents.json, digest: node.transaction.digest })
+    }
+    if (!page.pageInfo.hasNextPage) return events
+    after = page.pageInfo.endCursor
+  }
+}
+
+export async function getTransactionsJson(digests: string[]): Promise<Record<string, any>> {
+  const txs: Record<string, any> = {}
+  for (let i = 0; i < digests.length; i += 50) {
+    const keys = digests.slice(i, i + 50)
+    const { multiGetTransactions } = await graphqlCall(`query ($keys: [String!]!) { multiGetTransactions(keys: $keys) { digest transactionJson } }`, { keys })
+    multiGetTransactions.forEach((tx: any, j: number) => {
+      if (!tx?.transactionJson) throw new Error(`sui: transaction ${keys[j]} not found`)
+      txs[tx.digest] = tx.transactionJson
+    })
+  }
+  return txs
 }
 
 // graphql queryEvents doesn't retrieve historical events so we use allium for this

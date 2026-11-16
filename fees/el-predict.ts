@@ -8,7 +8,12 @@ import ADDRESSES from '../helpers/coreAssets.json'
 // platform's share (FeeAccrued to address(0) → claimProtocol → the hub's fee address), the market creator's share
 // (FeeAccrued to the creator), the settler's bounty (Bounty) and the rest to the market's house vault (Settled.toHouse).
 // When a market has no house LPs the rest goes back to the winners and is not a fee.
-const HUB = "0xBd65EE837e57D5060013cbE8bAc8a6d0F8037f45";
+// ElcasMarketsHub v1, then the V2 hubs: the launchpad's (books its game reserve opens for launched tokens) and the public one,
+// then the V3 hubs (2026-10-28 redeploy, same interface): the public one and the launchpad V3's
+const HUBS = [
+  "0xBd65EE837e57D5060013cbE8bAc8a6d0F8037f45", "0x9DB90Cf484614C3424a49B0cB0b6E5cA7b6a850F", "0xB7eF17054fb9541dd9Bc58E932Af116d11f2fD3f",
+  "0x2AC7854F4DBd6e18933dc6c87598532641898Ad1", "0xf31da25f3F4E2f041c63Aa0751ceB69f50fdFd5c",
+];
 const ZERO = ADDRESSES.null
 
 const SETTLED = "event Settled(uint256 indexed market, uint256 indexed epoch, uint8 status, uint256 payout, uint256 toProtocol, uint256 toHouse, uint256 houseResult)";
@@ -27,8 +32,11 @@ const fetch = async (options: FetchOptions) => {
   const dailyFees = options.createBalances();
   const dailyRevenue = options.createBalances();
   const dailySupplySideRevenue = options.createBalances();
-  const tokens: string[] = await options.api.call({ abi: "address[]:allPredictTokens", target: HUB });
-  const books: string[] = await options.api.multiCall({ abi: "function predictBook(address) view returns (address)", target: HUB, calls: tokens });
+  // (a hub not deployed yet at the window's block reads as empty)
+  const lists = await options.api.multiCall({ abi: "address[]:allPredictTokens", calls: HUBS, permitFailure: true });
+  const calls = HUBS.flatMap((hub, h) => (lists[h] ?? []).map((token: string) => ({ target: hub, params: [token] })));
+  const tokens: string[] = calls.map(c => c.params[0]);
+  const books: string[] = await options.api.multiCall({ abi: "function predictBook(address) view returns (address)", calls });
   const [settled, bounties, accrued] = await Promise.all([
     options.getLogs({ targets: books, eventAbi: SETTLED, flatten: false }),
     options.getLogs({ targets: books, eventAbi: BOUNTY, flatten: false }),

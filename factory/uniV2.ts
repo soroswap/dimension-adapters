@@ -1,7 +1,10 @@
 import * as sdk from "@defillama/sdk";
+import ADDRESSES from "../helpers/coreAssets.json";
 import { CHAIN } from "../helpers/chains";
 import { getUniV2LogAdapter, uniV2Exports } from "../helpers/uniswap";
 import { univ2Adapter2 } from "../helpers/getUniSubgraphVolume";
+import { addTokensReceived } from "../helpers/token";
+import { getLogsSplitAtCap } from "../helpers/logs";
 import { FetchOptions, SimpleAdapter } from "../adapters/types";
 import { createFactoryExports } from "./registry";
 
@@ -9,7 +12,243 @@ const velodromeSwapEvent = 'event Swap(address indexed sender, address indexed t
 const echodexSwapEvent = 'event Swap(address indexed sender, uint amount0In, uint amount1In, uint amount0Out, uint amount1Out, address indexed to, uint256 amountTokenFee, uint256 amountTokenReward)'
 const zealousSwapEvent = 'event Swap(address indexed sender, uint amount0In, uint amount1In, uint amount0Out, uint amount1Out, address indexed to, bool isDiscountEligible)'
 
+// customLogic hooks: report volume only (fee split unknown or not documented)
+const volumeOnly = ({ dailyVolume }: any) => ({ dailyVolume })
+
+// GT3: fees are collected by each pair's fees() contract; 85% to token holders, 15% to the protocol
+const gt3CustomLogic = async ({ dailyVolume, filteredPairs, fetchOptions }: any) => {
+  const filteredPairIds = Object.keys(filteredPairs)
+  const feeContracts = await fetchOptions.api.multiCall({ abi: 'address:fees', calls: filteredPairIds })
+
+  const dailyHoldersRevenue = await addTokensReceived({ options: fetchOptions, targets: feeContracts, skipIndexer: true })
+  const dailyRevenue = dailyHoldersRevenue.clone(1 / 0.85)
+  const dailyProtocolRevenue = dailyRevenue.clone(0.15)
+
+  return { dailyVolume, dailyProtocolRevenue, dailyHoldersRevenue, dailyRevenue, dailyFees: dailyRevenue }
+}
+
 const configs: Record<string, Record<string, any>> = {
+  "wemix.fi": {
+    // factory from the wemix-fi TVL adapter (DefiLlama-Adapters registries/uniswapV2.js), deployed block 207061 (2022-10-22)
+    // volume only: pair source unverified, fee split unknown
+    [CHAIN.WEMIX]: { factory: '0xe1F36C7B919c9f893E2Cd30b471434Aa2494664A', start: '2023-02-21', customLogic: volumeOnly },
+  },
+  "rcpswap": {
+    // Unchanged Uniswap V2: https://moonsdust.gitbook.io/rcpswap ; V2 charges 0.3%: https://developers.uniswap.org/docs/unichain/guides/create-a-pool
+    // Factory deployment: https://arbitrum-nova.blockscout.com/tx/0x64e8b50b2dda7f8d5e36ca43a177954b616a483f92e61535149e4b5a7fc395fa
+    // volume only: historical fee split not documented.
+    [CHAIN.ARBITRUM_NOVA]: { factory: '0xF9901551B4fDb1FE8d5617B5deB6074Bb8E1F6FB', start: '2022-07-24', fees: 0.003, customLogic: volumeOnly },
+  },
+  "bescswap": {
+    // Factory and 3/1000 pair invariant: https://explorer.beschyperchain.com/api?module=contract&action=getsourcecode&address=0x20EE72D1B7E36e97566f31761dfF14eDc35Fbf22
+    // Deployment 2025-08-25: https://explorer.beschyperchain.com/api/v2/addresses/0x20EE72D1B7E36e97566f31761dfF14eDc35Fbf22
+    // volume only: historical fee split not documented.
+    [CHAIN.BESC]: { factory: '0x20EE72D1B7E36e97566f31761dfF14eDc35Fbf22', start: '2025-08-25', fees: 0.003, customLogic: volumeOnly },
+  },
+  "sonefi-xyz": {
+    // V2 factory, pair swap event and 5/1000 invariant: https://soneium.blockscout.com/address/0x82d2d0aae77967d42acf4f30b53e2de0055338de?tab=contract
+    // Deployed 2025-01-07: https://soneium.blockscout.com/tx/0x0e9e0cced8e574ea223480991ca1e7d612927c49acad741a83aa5adbd4599296
+    // volume only: fee split not documented; feeTo is mutable.
+    [CHAIN.SONEIUM]: { factory: '0x82d2d0aAE77967d42ACf4F30B53e2de0055338De', start: '2025-01-07', fees: 0.005, customLogic: volumeOnly },
+  },
+  "latte": {
+    // Factory creates V2 pairs with a 25/10000 swap invariant: https://sourcify.dev/server/v2/contract/56/0x4dce5bdb81b8d5edb66ca1b8b2616a8e0dd5f807?fields=all
+    // volume only: historical fee split not documented; feeTo is mutable.
+    [CHAIN.BSC]: { factory: '0x4dce5bdb81b8d5edb66ca1b8b2616a8e0dd5f807', fees: 0.0025, customLogic: volumeOnly },
+  },
+  "pls2e": {
+    // V2 factory, pair swap invariant, and 3/1000 fee: https://sourcify.dev/server/v2/contract/56/0x0944ab692786d9104ae9a29778285c41c33c0415?fields=all
+    // volume only: historical fee split not documented; feeTo is mutable.
+    [CHAIN.BSC]: { factory: '0x0944ab692786d9104ae9a29778285c41c33c0415', fees: 0.003, customLogic: volumeOnly },
+  },
+  "lydia": {
+    // V2 factory, pair and 0.2% swap invariant; deployed at block 1160616 (2021-04-20 UTC): https://sourcify.dev/server/v2/contract/43114/0xe0c1bb6df4851feeedc3e14bd509feaf428f7655?fields=all
+    // volume only: fee split not documented; feeTo is mutable.
+    [CHAIN.AVAX]: { factory: '0xe0C1bb6DF4851feEEdc3E14Bd509FEAF428f7655', start: '2021-04-20', fees: 0.002, customLogic: volumeOnly },
+  },
+  "pacificswap": {
+    // Factory creates V2 pairs with a 2/1000 swap invariant: https://pacific-explorer.manta.network/address/0x19405689008954ccddbc8c7ef2b64dd88b4a674a?tab=contract
+    // Factory deployed 2023-10-07: https://pacific-explorer.manta.network/tx/0x387f58211555f7b6e35ff159c9148986c2834ffed8ede7a3ea02045281aced5c
+    // volume only: historical fee split not documented; feeTo can change.
+    [CHAIN.MANTA]: { factory: '0x19405689008954ccddbc8c7ef2b64dd88b4a674a', start: '2023-10-07', fees: 0.002, customLogic: volumeOnly },
+  },
+  "qomx": {
+    // V2 factory, 3/1000 pair invariant and deployment at block 110369670: https://sourcify.dev/server/v2/contract/56/0x356037CbC77B3A2B36E0484d96DF0De247e66785?fields=all
+    // volume only: fee split not documented; feeTo is mutable.
+    [CHAIN.BSC]: { factory: '0x356037CbC77B3A2B36E0484d96DF0De247e66785', start: '2026-07-16', fees: 0.003, customLogic: volumeOnly },
+  },
+  "cobraswap": {
+    // V2 pair creation and 3/1000 swap invariant; deployment block 9503477 (2021-07-26): https://sourcify.dev/server/v2/contract/56/0x3165d94dd2f71381495cb897832de02710a0dce5?fields=all
+    // volume only: historical fee split not documented; feeTo is mutable.
+    [CHAIN.BSC]: { factory: '0x3165d94dd2f71381495cb897832de02710a0dce5', start: '2021-07-26', fees: 0.003, customLogic: volumeOnly },
+  },
+  "shibanova": {
+    // V2 pair creation and 20/10000 swap invariant; factory deployed at block 9212526 on 2021-07-16:
+    // https://sourcify.dev/server/v2/contract/56/0x251912de998ec91dfdf67efbe032d6f4ab5ec485?fields=all
+    // volume only: historical fee split not documented; feeTo and feeAmount are mutable.
+    [CHAIN.BSC]: { factory: '0x251912de998ec91dfdf67efbe032d6f4ab5ec485', start: '2021-07-16', fees: 0.002, customLogic: volumeOnly },
+  },
+  "gassss": {
+    // Factory deployment and V2 pair's 3/1000 swap invariant: https://github.com/GASSSS-XYZ/swap/tree/5259b2f863a3fc88b2a81d6be543c5247356f13f
+    // volume only: feeTo can change, so the historical fee split is not established.
+    [CHAIN.STABLE]: { factory: '0x603EfDF29606BfB90f8f1068828c79cB2d5eD056', fees: 0.003, customLogic: volumeOnly },
+  },
+  "candycity": {
+    // V2 factory and 15/10000 swap invariant: https://sourcify.dev/server/v2/contract/25/0x84343b84eed78228ccfb65eadee7659f246023bf?fields=all
+    // volume only: feeTo is mutable and the historical fee split is not established.
+    [CHAIN.CRONOS]: { factory: '0x84343b84EEd78228CCFB65EAdEe7659F246023bf', fees: 0.0015, customLogic: volumeOnly },
+  },
+  "cafeswap": {
+    // Both factories create V2 pairs with a 2/1000 swap invariant:
+    // https://sourcify.dev/server/v2/contract/56/0x3e708fdbe3ada63fc94f8f61811196f1302137ad?fields=all
+    // https://sourcify.dev/server/v2/contract/137/0x5ede3f4e7203bf1f12d57af1810448e5db20f46c?fields=all
+    // volume only: historical fee split not documented; feeTo is mutable.
+    [CHAIN.BSC]: { factory: '0x3e708fdbe3ada63fc94f8f61811196f1302137ad', fees: 0.002, customLogic: volumeOnly },
+    [CHAIN.POLYGON]: { factory: '0x5ede3f4e7203bf1f12d57af1810448e5db20f46c', fees: 0.002, customLogic: volumeOnly },
+  },
+  "narwhalswap": {
+    // V2 pair creation and 3/1000 swap invariant: https://sourcify.dev/server/v2/contract/56/0xb9fa84912ff2383a617d8b433e926adf0dd3fea1?fields=all
+    // volume only: fee split not documented; feeTo can be changed.
+    [CHAIN.BSC]: { factory: '0xB9fA84912FF2383a617d8b433E926Adf0Dd3FEa1', fees: 0.003, customLogic: volumeOnly },
+  },
+  "rocketswap-cc": {
+    // Factory creates V2 pairs with a 3/1000 swap fee; deployment block 1732443: https://sourcify.dev/server/v2/contract/8453/0x1b8128c3a1b7d20053d10763ff02466ca7ff99fc?fields=all
+    // volume only: historical fee split not documented; feeTo is mutable.
+    [CHAIN.BASE]: { factory: '0x1b8128c3a1b7d20053d10763ff02466ca7ff99fc', start: '2023-07-25', fees: 0.003, customLogic: volumeOnly },
+  },
+  "arthswap": {
+    // V2 factory and 3/1000 pair invariant: https://astar.blockscout.com/address/0xA9473608514457b4bF083f9045fA63ae5810A03E?tab=contract
+    // Deployed 2022-01-18: https://astar.blockscout.com/tx/0xaa7e78a7219f60d2333eab03c8869dfd8eb460996264405949d1682ab80d1983
+    // volume only: historical fee split not documented; feeTo is mutable.
+    [CHAIN.ASTAR]: { factory: '0xA9473608514457b4bF083f9045fA63ae5810A03E', start: '2022-01-18', fees: 0.003, customLogic: volumeOnly },
+  },
+  "coinswap": {
+    // Pair factory() points to this factory at BSC block 132872055; verified pair uses V2 swaps with a 0.2% fee:
+    // https://sourcify.dev/server/v2/contract/56/0x693d208d53fe2b3a0920530ba48635f050dc2fca?fields=all
+    // volume only: historical fee split and recipients are not documented.
+    [CHAIN.BSC]: { factory: '0xc2d8d27f3196d9989abf366230a47384010440c0', fees: 0.002, customLogic: volumeOnly },
+  },
+  "ponder": {
+    // Factory address: https://github.com/ponderfinance/protocol/blob/46382ce6604763e24b82caa514caf76efae6df09/addresses/96.json
+    // V2 events: https://github.com/ponderfinance/protocol/blob/46382ce6604763e24b82caa514caf76efae6df09/src/core/pair/PonderPair.sol
+    // Swap invariant and variable creator share: https://github.com/ponderfinance/protocol/blob/46382ce6604763e24b82caa514caf76efae6df09/src/core/pair/libraries/PonderFeesLib.sol
+    // volume only: fee split varies by pair and input token; use Sync logs because historical pool balance calls failed.
+    [CHAIN.BITKUB]: { factory: '0x20b17e92dd1866ec647acaa38fe1f7075e4b359e', fees: 0.003, customLogic: volumeOnly, useSyncReserves: true },
+  },
+  "julswap": {
+    // V2 factory, 3/1000 swap invariant and deployment block 784352 (2020-09-25): https://sourcify.dev/server/v2/contract/56/0x553990f2cba90272390f62c5bdb1681ffc899675?fields=all
+    // volume only: fee split not documented; feeTo is mutable.
+    [CHAIN.BSC]: { factory: '0x553990f2cba90272390f62c5bdb1681ffc899675', start: '2020-09-25', fees: 0.003, customLogic: volumeOnly },
+  },
+  "pantherswap": {
+    // Factory creates PantherPair; its invariant charges 2/1000: https://sourcify.dev/server/v2/contract/56/0x670f55c6284c629c23bae99f585e3f17e8b9fc31?fields=all
+    // Deployment block 7119352 (2021-05-04 UTC); volume only: historical fee split not documented.
+    [CHAIN.BSC]: { factory: '0x670f55c6284c629c23bae99f585e3f17e8b9fc31', start: '2021-05-04', fees: 0.002, customLogic: volumeOnly },
+  },
+  "gullnetwork-amm": {
+    // Verified factory and pair: https://pacific-explorer.manta.network/address/0x31a78894a2b5de2c4244cd41595cd0050a906db3?tab=contract
+    // Deployment: https://pacific-explorer.manta.network/tx/0x78f6bd26a4f27c03f89d3f0701e3df24eaf2c845f740940f5445121ff3b31fed
+    // Volume only: fees and protocol split are mutable, so historical attribution is not established.
+    [CHAIN.MANTA]: { factory: '0x31a78894a2b5de2c4244cd41595cd0050a906db3', start: '2024-05-21', customLogic: volumeOnly },
+  },
+  "sharkswap-finance": {
+    // V2 factory and pair swap invariant (3/1000): https://sourcify.dev/server/v2/contract/8453/0x57592D44eb60011500961EF177BFf8D8691D5a8B?fields=all
+    // volume only: fee split not documented historically; feeTo is mutable.
+    [CHAIN.BASE]: { factory: '0x57592D44eb60011500961EF177BFf8D8691D5a8B', fees: 0.003, customLogic: volumeOnly },
+  },
+  "twindex": {
+    // V2 factory and pair code, including 3/1000 swap invariant: https://sourcify.dev/server/v2/contract/56/0x4E66Fda7820c53C1a2F601F84918C375205Eac3E?fields=all
+    // volume only: fee split not documented; feeTo is mutable.
+    [CHAIN.BSC]: { factory: '0x4E66Fda7820c53C1a2F601F84918C375205Eac3E', fees: 0.003, customLogic: volumeOnly },
+  },
+  "thetaswap": {
+    // V2 protocol: https://thetaswap.org/tos; 0.3% to LPs: https://thetaswap.org/
+    // Factory: https://github.com/DefiLlama/DefiLlama-Adapters/blob/6143db0bdca0485b8cc75a599cb051b573a32d9a/registries/uniswapV2.js#L2117
+    // feeTo was zero at Theta block 36645910.
+    [CHAIN.THETA]: { factory: '0xe8b97478ae8ab1fcfd46cdb2f62869ec63bbf69f', fees: 0.003, userFeesRatio: 1, revenueRatio: 0, protocolRevenueRatio: 0 },
+  },
+  "squidswap": {
+    // V2 factory and 3/1000 pair swap invariant: https://explorer.inkonchain.com/address/0x63b54dBBD2DAbf89D5c536746e534711f6094199?tab=contract
+    // Deployed 2024-12-18: https://explorer.inkonchain.com/tx/0xb6f24032d7f8b428e3eb4114f19af175944d049639f0dea2dda8b3798db89f2b
+    // volume only: fee split not documented; feeTo can change.
+    [CHAIN.INK]: { factory: '0x63b54dBBD2DAbf89D5c536746e534711f6094199', start: '2024-12-18', fees: 0.003, customLogic: volumeOnly },
+  },
+  "w3swap": {
+    // V2 pair creation and 3/10000 swap invariant: https://sourcify.dev/server/v2/contract/56/0xd04a80baeef12fd7b1d1ee6b1f8ad354f81bc4d7?fields=all
+    // Factory deployment block 19248971 was 2022-07-04 UTC; volume only: historical fee split not documented.
+    [CHAIN.BSC]: { factory: '0xD04A80baeeF12fD7b1D1ee6b1f8ad354f81bc4d7', start: '2022-07-04', fees: 0.0003, customLogic: volumeOnly },
+  },
+  "cronaswap": {
+    // Factory: https://docs.cronaswap.org/contract-detail
+    // V2 Swap and 0.25% invariant: https://cronos.org/explorer/address/0xc9B718963aeF15D7558f6114e717058bB013204a/contracts
+    // volume only: historical fee split and feeTo status are not established.
+    [CHAIN.CRONOS]: { factory: '0x73A48f8f521EB31c55c0e1274dB0898dE599Cb11', fees: 0.0025, customLogic: volumeOnly },
+  },
+  "spartadex": {
+    // V2 pair creation and 0.3% swap invariant: https://sourcify.dev/server/v2/contract/42161/0xFe8EC10Fe07A6a6f4A2584f8cD9FE232930eAF55?fields=all
+    // Linea factory uses the same pair code: https://sourcify.dev/server/v2/contract/59144/0x9E4Fc4a5A0769ba74088856C229c4a1Db2Ea5A9e?fields=all
+    // Deployment blocks 117753271 and 3590497; volume only: historical fee split not documented.
+    [CHAIN.ARBITRUM]: { factory: '0xFe8EC10Fe07A6a6f4A2584f8cD9FE232930eAF55', start: '2023-08-03', fees: 0.003, customLogic: volumeOnly },
+    [CHAIN.LINEA]: { factory: '0x9E4Fc4a5A0769ba74088856C229c4a1Db2Ea5A9e', start: '2024-04-11', fees: 0.003, customLogic: volumeOnly },
+  },
+  "koffeeswap": {
+    // Factory and V2 pair source: https://koffeeswap.medium.com/exchange-contracts-dba53d7bae14
+    // Pair swap charges 3/1000: https://github.com/KoffeeSwap/koffeeswap-contracts/blob/master/factory/KoffeeSwapPair.sol
+    // Factory deployment 2021-06-17: https://scan.kcc.io/tx/0x48c06beb59797b7fc8537341537d5cbd934e381b33256166882aba188e36b402
+    // volume only: fee split not documented
+    [CHAIN.KCC]: { factory: '0xc0ffee00000e1439651c6ad025ea2a71ed7f3eab', start: '2021-06-17', fees: 0.003, customLogic: volumeOnly },
+  },
+  "pureswap": {
+    // Factory creates V2 pairs; swap invariant charges 3/1000: https://sourcify.dev/server/v2/contract/56/0x94b4188d143b9dd6bd7083ae38a461fcc6aad07e?fields=all
+    // volume only: fee split not documented; feeTo is mutable and pair mints to two recipients.
+    [CHAIN.BSC]: { factory: '0x94b4188D143b9dD6bd7083aE38A461FcC6AAd07E', fees: 0.003, customLogic: volumeOnly },
+  },
+  "arbswap": {
+    // Factories create SwapPair contracts with a 3/1000 swap fee; deployment blocks give the UTC start dates:
+    // https://sourcify.dev/server/v2/contract/42161/0xd394e9cc20f43d2651293756f8d320668e850f1b?fields=all (block 3692134)
+    // https://sourcify.dev/server/v2/contract/42170/0xf6239423fcf1c19ed2791d9648a90836074242fd?fields=all (block 727)
+    // volume only: fee split not documented
+    [CHAIN.ARBITRUM]: { factory: '0xd394e9cc20f43d2651293756f8d320668e850f1b', start: '2021-12-09', fees: 0.003, customLogic: volumeOnly },
+    [CHAIN.ARBITRUM_NOVA]: { factory: '0xf6239423fcf1c19ed2791d9648a90836074242fd', start: '2022-08-09', fees: 0.003, customLogic: volumeOnly },
+  },
+  "gibxswap": {
+    // Verified factory and pair: https://sourcify.dev/server/v2/contract/56/0x97bCD9BB482144291D77ee53bFa99317A82066E8?fields=all
+    // V2 PairCreated and Swap events; swap fee 3/1000. Factory deployed at block 10913313 on 2021-09-14.
+    // volume only: feeTo is mutable and its historical protocol share is not established.
+    [CHAIN.BSC]: { factory: '0x97bCD9BB482144291D77ee53bFa99317A82066E8', start: '2021-09-14', fees: 0.003, customLogic: volumeOnly },
+  },
+  "inkyswap": {
+    // Verified V2 factory and 0.3% pair fee: https://explorer.inkonchain.com/address/0x458c5d5b75ccba22651d2c5b61cb1ea1e0b0f95d?tab=contract
+    // Factory deployed 2024-12-17: https://explorer.inkonchain.com/tx/0x6d777441da3a1df1e2317d7bd00f9ed56a176f6a21bf8167aef212534e029b96
+    // volume only: fee split not documented
+    [CHAIN.INK]: { factory: '0x458C5d5B75ccBA22651D2C5b61cB1EA1e0b0f95D', start: '2024-12-17', customLogic: volumeOnly },
+  },
+  "beam-swap": {
+    // Factory and 0.3% V2 pair invariant: https://sourcify.dev/server/v2/contract/4337/0x662b526fb70ebb508962f3f61c9f735f687c8fa5?fields=sources,compilation,deployment
+    // Factory deployment block 295 is 2023-08-18 UTC; volume only: fee split not documented.
+    [CHAIN.BEAM]: { factory: '0x662b526FB70EBB508962f3f61c9F735f687C8fA5', start: '2023-08-18', fees: 0.003, customLogic: volumeOnly },
+  },
+  "bscswap": {
+    // V2 pair creation and 3/1000 swap invariant: https://sourcify.dev/server/v2/contract/56/0xce8fd65646f2a2a897755a1188c04ace94d2b8d0?fields=sources
+    // Deployment block 458157 (2020-09-14); volume only: fee split not documented, feeTo is mutable.
+    [CHAIN.BSC]: { factory: '0xce8fd65646f2a2a897755a1188c04ace94d2b8d0', start: '2020-09-14', fees: 0.003, customLogic: volumeOnly },
+  },
+  "spacefi-zksync": {
+    // Factory from the spacefi-zksync TVL adapter (DefiLlama-Adapters registries/uniswapV2.js)
+    // Deployed 2023-03-18: https://explorer.zksync.io/tx/0x4e768c3e9cd2e765c03fc74fe558f4b1b54f9357b29ca43364add1106458ace9
+    // start is the first day the pools can be valued: coins.llama.fi has no historical price for Era USDC
+    // (0x3355df6d...) before 2024-02-15, so earlier days filter down to zero pools.
+    // volume only: the factory source is not verified, so the swap fee and its split are not established.
+    [CHAIN.ERA]: { factory: '0x0700Fb51560CfC8F896B2c812499D17c5B0bF6A7', start: '2024-02-15', customLogic: volumeOnly },
+  },
+  "rocketswap-anubis": {
+    // V2 factory from the rocketswap-anubis TVL adapter (DefiLlama-Adapters registries/uniswapV2.js), deployed at Anubis block 2059 (2026-04-07)
+    // start is the first full day pool balances can be read: Multicall3 only exists on Anubis from 2026-05-06,
+    // and scanning Sync logs of all 900+ pairs instead (useSyncReserves) does not complete for a day.
+    // maxPairSize 100: 53 to 56 pools pass the $200 pooled value filter (2026-11-13), above the default cap of 42.
+    // volume only: the swap fee and its split are not documented. The V3 pools are listed separately as rocketswap-anubis-v3.
+    [CHAIN.ANUBI]: { factory: '0xaf6F4e641C86A25518509BC840051A8652Af598A', start: '2026-05-07', customLogic: volumeOnly, maxPairSize: 100 },
+  },
   "bdex-v2": {
     // stock uniV2 fork on BOT Chain. Factory: https://dev-docs.botchain.ai/docs/DEX/contract-addresses/
     // feeTo() is the zero address (https://scan.botchain.ai/address/0x117115f3B72C8d1989178089A67D0C26f8EE0AA3, checked 2026-09-22) => 0.3% swap fee, 100% to LPs
@@ -53,6 +292,25 @@ const configs: Record<string, Record<string, any>> = {
     // uniV2 fork on Hedera, replaces dead GraphQL backend
     [CHAIN.HEDERA]: { factory: '0x0000000000000000000000000000000000134224', start: '2022-10-05' },
   },
+  "somnex-xyz": {
+    // uniV2 fork on Somnia; the api.subgraph.somnia.network subgraph no longer resolves. Factory from TVL registry uniswapV2.js.
+    // 0.5% swap fee: swaps on pair 0x994570aa6a46d2bc0358f799634ae8db79b8cd73 match the 0.5% constant-product quote against the prior reserves (checked 2026-11-01).
+    // fetch is overridden below to split log requests under the Somnia RPC log cap
+    [CHAIN.SOMNIA]: { factory: '0xaFd71143Fb155058e96527B07695D93223747ed1', start: '2025-09-02', fees: 0.005 },
+  },
+  "reddex": {
+    // uniV2 fork on Redbelly; replaces the rednode.elephantthink.com subgraph (host returns 502, last stored day 2026-10-18). Factory from TVL registry uniswapV2.js.
+    // WRBNT and USDC.e have DefiLlama prices only from 2025-07-10, so earlier days undercount: history before 2026-10-19 comes from the subgraph, do not refill it from here.
+    // reddexv2Pair._mintFee uses denominator (rootK * 3) + rootKLast instead of the usual (rootK * 5), so feeTo takes 1/4 of the 0.3% swap fee
+    [CHAIN.REDBELLY]: { factory: '0x262E06314Af8f4EEd70dbd8C7EFe2a5De686C142', start: '2025-01-12', fees: 0.003, userFeesRatio: 1, revenueRatio: 0.25, protocolRevenueRatio: 0.25, holdersRevenueRatio: 0, allowReadPairs: true },
+  },
+  "tealswap": {
+    // uniV2 fork on Oasys hub-layer; the sbb.sooho.io dashboard API no longer resolves. Factory from TVL registry uniswapV2.js.
+    // 0.5% swap fee: swaps on pairs 0x19c6d1c6b13eff2125f9b7c9551f4bbb264f0bd4 and 0x1bbebf2d72a8f76e02c848168c37bbc2c3783deb match the 0.5% constant-product quote against the prior reserves (checked 2026-11-01).
+    // feeTo is set but the protocol's share is undocumented, so revenue is not split out
+    // start: swaps begin 2022-12-14 but WOAS has no price before 2022-12-15, so that day would store $0
+    [CHAIN.OAS]: { factory: '0x5200000000000000000000000000000000000018', start: '2022-12-15', fees: 0.005 },
+  },
   "warpx-v2": {
     [CHAIN.MEGAETH]: { factory: '0xB3Ae00A68F09E8b8a003B7669e2E84544cC4a385' },
   },
@@ -60,12 +318,11 @@ const configs: Record<string, Record<string, any>> = {
     // stock uniV2 fork with feeTo enabled at deploy => 1/6 of the 0.3% swap fee to protocol
     [CHAIN.RISE]: { factory: '0xd479E71C45aEB1E846A7B549c346D62fE77B39bA', start: '2026-05-31', userFeesRatio: 1, revenueRatio: 1 / 6, protocolRevenueRatio: 1 / 6 },
   },
-  "sonevibe": {
-    [CHAIN.SONEIUM]: { factory: '0x06C0b58287794a0bdce20ce768b601CA974618DC', start: '2025-12-15', fees: 0.0025, userFeesRatio: 1, revenueRatio: 1 / 6, protocolRevenueRatio: 1 / 6, allowReadPairs: true },
-  },
   "piperx-v2": {
     // replaces the goldsky subgraph adapter, which stopped writing rows in 2026-09
-    [CHAIN.STORY]: { factory: '0x6D3e2f58954bf4E1d0C4bA26a85a1b49b2e244C6', start: '2025-02-12', fees: 0.003, userFeesRatio: 1 },
+    // useSyncReserves: since ~2026-11-03 no public Story RPC serves past state (ankr wants a key, thirdweb,
+    // storyrpc.io, datarpc.io prune; the datanetscan.io explorer proxy allows 10 requests/hour), but logs are full history
+    [CHAIN.STORY]: { factory: '0x6D3e2f58954bf4E1d0C4bA26a85a1b49b2e244C6', start: '2025-02-12', fees: 0.003, userFeesRatio: 1, useSyncReserves: true },
   },
   "flowswap-v2": {
     [CHAIN.FLOW]: { factory: '0x681D1bFE03522e0727730Ba02a05CD3C0a08fa30' },
@@ -244,7 +501,8 @@ const configs: Record<string, Record<string, any>> = {
     [CHAIN.AURORA]: { factory: '0x7928D4FeA7b2c90C732c10aFF59cf403f0C38246' },
   },
   "wigoswap": {
-    [CHAIN.FANTOM]: { factory: '0xc831a5cbfb4ac2da5ed5b194385dfd9bf5bfcba7' },
+    // 0.19% swap fee: 0.18% to LPs, 0.01% to WIGO stakers
+    [CHAIN.FANTOM]: { factory: '0xc831a5cbfb4ac2da5ed5b194385dfd9bf5bfcba7', start: '2022-01-24', fees: 0.0019, userFeesRatio: 1, revenueRatio: 0.01 / 0.19, protocolRevenueRatio: 0, holdersRevenueRatio: 0.01 / 0.19 },
   },
   "wineryswap": {
     [CHAIN.BSC]: { factory: '0x79C342FddBBF376cA6B4EFAc7aaA457D6063F8Cb' },
@@ -281,6 +539,8 @@ const configs: Record<string, Record<string, any>> = {
   "wardenswap": {
     [CHAIN.BSC]: { factory: '0x3657952d7bA5A0A4799809b5B6fdfF9ec5B46293', start: '2021-06-23' },
   },
+  // Changes to this entry require further approval before merging: a Trueo market depends on the
+  // Velodrome V1 revenue fees/velodrome derives from it.
   "velodrome": {
     [CHAIN.OPTIMISM]: { factory: '0x25CbdDb98b35ab1FF77413456B31EC81A6B6B746', fees: 0.0005, stableFees: 0.0002, start: '2023-02-23' },
   },
@@ -315,8 +575,10 @@ const configs: Record<string, Record<string, any>> = {
     defichain_evm: { factory: '0x79Ea1b897deeF37e3e42cDB66ca35DaA799E93a3' },
   },
   "vapordex-v1": {
-    [CHAIN.AVAX]: { factory: '0xc009a670e2b02e21e7e75ae98e254f467f7ae257' },
-    [CHAIN.APECHAIN]: { factory: '0xc009a670e2b02e21e7e75ae98e254f467f7ae257' },
+    // 0.29% fee hardcoded in Pair.swap, all of it to LPs
+    [CHAIN.AVAX]: { factory: '0xc009a670e2b02e21e7e75ae98e254f467f7ae257', start: '2023-09-19', fees: 0.0029, userFeesRatio: 1, revenueRatio: 0, protocolRevenueRatio: 0, holdersRevenueRatio: 0, allowReadPairs: true },
+    [CHAIN.TELOS]: { factory: '0xDef9ee39FD82ee57a1b789Bc877E2Cbd88fd5caE', start: '2024-01-17', fees: 0.0029, userFeesRatio: 1, revenueRatio: 0, protocolRevenueRatio: 0, holdersRevenueRatio: 0, allowReadPairs: true }, // no pair created so far, expect 0 values
+    // [CHAIN.APECHAIN]: no active contract, no pools to track
   },
   'capybara-v2': {
     [CHAIN.KLAYTN]: { factory: '0xE4296d6161c8a1554a18dba79C0f825cE23bAE42', start: '2025-01-01', fees: 0.25 / 100, userFeesRatio: 1, revenueRatio: 0.4, protocolRevenueRatio: 0.4 },
@@ -428,7 +690,7 @@ const configs: Record<string, Record<string, any>> = {
     [CHAIN.LINEA]: { factory: '0xbc7695fd00e3b32d08124b7a4287493aee99f9ee', start: '2024-02-11', fees: 0.0025, stableFees: 0.0001, userFeesRatio: 1, revenueRatio: 1, protocolRevenueRatio: 0, holdersRevenueRatio: 1 },
   },
   "gt3": {
-    [CHAIN.POLYGON]: { factory: '0x2d7360Db7216792cfc2c73B79C0cA629007E2af4', start: '2025-04-23' },
+    [CHAIN.POLYGON]: { factory: '0x2d7360Db7216792cfc2c73B79C0cA629007E2af4', start: '2025-04-23', customLogic: gt3CustomLogic },
   },
   "9mm-v2": {
     [CHAIN.PULSECHAIN]: { factory: '0x3a0Fa7884dD93f3cd234bBE2A0958Ef04b05E13b', fees: 0.0025, revenueRatio: 0.08 / 0.25, protocolRevenueRatio: 0.08 / 0.25 },
@@ -510,7 +772,7 @@ const configs: Record<string, Record<string, any>> = {
     [CHAIN.MEGAETH]: { factory: '0xC60940F182F7699522970517f6d753A560546937', start: '2026-02-05', userFeesRatio: 1, revenueRatio: 0 },
   },
   "daoaas-swap": {
-    [CHAIN.ENI]: { factory: '0x548C0E26CE90B333c07abb6d55546304D46d269d', start: '2025-06-01', userFeesRatio: 1, revenueRatio: 0.5, protocolRevenueRatio: 0.5 },
+    [CHAIN.ENI]: { factory: '0x548C0E26CE90B333c07abb6d55546304D46d269d', start: '2025-06-01', userFeesRatio: 1, revenueRatio: 0.5, protocolRevenueRatio: 0.5, enforceBalanceFailureRatio: true },
   },
   "mute.io": {
     [CHAIN.ERA]: { factory: '0x40be1cba6c5b47cdf9da7f963b6f761f4c60627d', start: '2023-03-23', userFeesRatio: 1, revenueRatio: 0.2, protocolRevenueRatio: 0.2 },
@@ -867,7 +1129,9 @@ const configs: Record<string, Record<string, any>> = {
     [CHAIN.HYPERLIQUID]: { factory: "0x98e19A533FadB2C9853983772E4e7aa09a1478e0", fees: 0.003, revenueRatio: 0.16, start: "2025-07-26" },
   },
   "catnip": {
-    [CHAIN.ROBINHOOD]: { factory: "0x002EC9782d70f4e79396c58964D4691cA648FB49", fees: 0.003, revenueRatio: 0, protocolRevenueRatio: 0, start: "2026-07-14" }
+    // 0.3% swap fee; feeTo is set to the NIP maker, and AlleyPair._mintFee mints it 1/3 of fee growth
+    // (denominator rootK * 2 + rootKLast), which the maker converts to NIP for the xNIP vault (Catnip Cache)
+    [CHAIN.ROBINHOOD]: { factory: "0x002EC9782d70f4e79396c58964D4691cA648FB49", fees: 0.003, userFeesRatio: 1, revenueRatio: 1 / 3, protocolRevenueRatio: 0, holdersRevenueRatio: 1 / 3, start: "2026-07-14" }
   },
   "sheriff-v2": {
     [CHAIN.ROBINHOOD]: { factory: "0x10F7D1eF77f58181484936170430DF13539C5162", fees: 0.005, revenueRatio: 0.3, protocolRevenueRatio: 0.3, start: "2026-07-03" }
@@ -877,7 +1141,79 @@ const configs: Record<string, Record<string, any>> = {
   },
   "bulbaswap-v2": {
     [CHAIN.MORPH]: { factory: "0x8D2A8b8F7d200d75Bf5F9E84e01F9272f90EFB8b", fees: 0.0035, userFeesRatio: 1, revenueRatio: 2 / 7, protocolRevenueRatio: 2 / 7, start: "2024-10-27" }
-  }
+  },
+  "beamswap-classic": {
+    // 0.30% swap fee, 0.13% of it to the protocol
+    [CHAIN.MOONBEAM]: { factory: '0x985BcA32293A7A496300a48081947321177a86FD', revenueRatio: 0.13 / 0.30, protocolRevenueRatio: 0.13 / 0.30 },
+  },
+  "baseswap-v2": {
+    // PancakeSwap V2 fork: 0.25% swap fee, 32% of it (8/25 in _mintFee) minted to feeTo, the treasury multisig
+    [CHAIN.BASE]: { factory: '0xFDa619b6d20975be80A10332cD39b9a4b0FAa8BB', start: '2023-07-28', fees: 0.0025, userFeesRatio: 1, revenueRatio: 0.32, protocolRevenueRatio: 0.32, holdersRevenueRatio: 0 },
+  },
+  "voltswap-v1": {
+    // all swap fees go to VOLT stakers
+    [CHAIN.METER]: { factory: '0x56aD9A9149685b290ffeC883937caE191e193135', revenueRatio: 1, protocolRevenueRatio: 0, holdersRevenueRatio: 1 },
+  },
+  "voltswap-v2": {
+    // all swap fees go to VOLT stakers
+    [CHAIN.METER]: { factory: '0xb33dE8C0843F90655ad6249F20B473a627443d21', revenueRatio: 1, protocolRevenueRatio: 0, holdersRevenueRatio: 1 },
+  },
+  "surfswap-classic": {
+    [CHAIN.KAVA]: { factory: '0xc449665520C5a40C9E88c7BaDa149f02241B1f9F', start: '2022-08-05' },
+  },
+  "smbswap-v2": {
+    // PancakeSwap-v2 fork: 0.25% swap fee; no documented protocol take, all fees to LPs
+    [CHAIN.BSC]: { factory: '0x2Af5c23798FEc8E433E11cce4A8822d95cD90565', fees: 0.0025, userFeesRatio: 1, revenueRatio: 0 },
+  },
+  "fstswap": {
+    // Uniswap-V2 fork, 0.3% swap fee and feeTo-gated _mintFee (verified source: https://sourcify.dev/server/v2/contract/56/0x9a272d734c5a0d7d84e0a892e891a553e8066dce)
+    // feeTo is mutable and its history is unverified, so report volume only until the revenue split is established
+    [CHAIN.BSC]: { factory: '0x9a272d734c5a0d7d84e0a892e891a553e8066dce', start: '2021-12-23', fees: 0.003, customLogic: volumeOnly },
+  },
+  "swapbased-v2": {
+    // 0.30% swap fee: 0.25% to LPs, 0.05% to the treasury
+    [CHAIN.BASE]: { factory: '0x04C9f118d21e8B767D2e50C946f0cC9F6C367300', start: '2023-07-28', userFeesRatio: 1, revenueRatio: 1 / 6, protocolRevenueRatio: 1 / 6 },
+  },
+  "dragonswap-v2": {
+    // 0.30% swap fee, 20% of it to the treasury
+    [CHAIN.KLAYTN]: { factory: '0x224302153096E3ba16c4423d9Ba102D365a94B2B', revenueRatio: 0.2, protocolRevenueRatio: 0.2 },
+  },
+  "baryon": {
+    // volume only: fee split not documented
+    [CHAIN.BSC]: { factory: '0x03879e2a3944fd601e7638dfcbc9253fb793b599', start: '2023-08-12', customLogic: volumeOnly },
+    [CHAIN.ANCIENT8]: { factory: '0xAE12C5930881c53715B369ceC7606B70d8EB229f', start: '2023-08-12', customLogic: volumeOnly },
+    [CHAIN.BITKUB]: { factory: '0xf7eEe3A8363731C611A24CdDfCBcaDE9C153Cfe8', start: '2023-08-12', customLogic: volumeOnly },
+  },
+  "diamond-fi": {
+    // Factory creates V2-style pairs; the 0.3% swap fee's protocol share varies by pair and feeTo:
+    // https://www.kubscan.com/address/0x6E906Dc4749642a456907deCB323A0065dC6F26E?tab=contract
+    // Factory deployed 2021-10-23: https://www.kubscan.com/tx/0x1ca9e708fde620d2f08884d944a7f3b4a95c94c8907ecfdeb5ce64645353f041
+    [CHAIN.BITKUB]: { factory: '0x6E906Dc4749642a456907deCB323A0065dC6F26E', start: '2021-10-23', customLogic: volumeOnly },
+  },
+  "fvm-exchange": {
+    [CHAIN.FANTOM]: { factory: '0x472f3C3c9608fe0aE8d702f3f8A2d12c410C881A', blacklistTokens: ['0xB8a32897016C1B2ee0797090162eAFe58f032795'] },
+  },
+  "metropolis-amm": {
+    // 0.3% swap fee: 60% to LPs, 30% to holders, 10% to the protocol
+    [CHAIN.SONIC]: { factory: '0x1570300e9cFEC66c9Fb0C8bc14366C86EB170Ad0', start: '2024-12-16', fees: 0.003, userFeesRatio: 1, revenueRatio: 0.4, holdersRevenueRatio: 0.3, protocolRevenueRatio: 0.1 },
+  },
+  "integral": {
+    // no revenue from fees: https://docs.integral.link/size/getting-started/liquidity-provider/earning-fees#mechanism
+    [CHAIN.ETHEREUM]: { factory: '0xC480b33eE5229DE3FbDFAD1D2DCD3F3BAD0C56c6', revenueRatio: 0 },
+    [CHAIN.ARBITRUM]: { factory: '0x717EF162cf831db83c51134734A15D1EBe9E516a', revenueRatio: 0 },
+  },
+  "potatoswap": {
+    // flat 0.25% swap fee on volatile and stable pools: 0.17% to LPs, 0.08% to vePOT holders
+    [CHAIN.XLAYER]: { factory: '0x630db8e822805c82ca40a54dae02dd5ac31f7fcf', start: '2024-04-16', fees: 0.0025, stableFees: 0.0025, userFeesRatio: 1, revenueRatio: 8 / 25, protocolRevenueRatio: 0, holdersRevenueRatio: 8 / 25 },
+  },
+  "dexswap": {
+    [CHAIN.ARBITRUM]: { factory: '0x3e40739d8478c58f9b973266974c58998d4f9e8b', start: '2023-05-21' },
+  },
+  "bitblocks-finance-v2": {
+    // 0.25% swap fee; 8/25 (32%) of it to the protocol through LP-token minting while the factory feeTo is set.
+    // fetch is overridden below to read feeTo at run time, so revenue drops to zero if it is ever unset.
+    [CHAIN.BSC]: { factory: '0x65b3cc7a7cb167221266fc93884717de2dbd074e', start: '2022-04-26', fees: 0.0025, userFeesRatio: 1, revenueRatio: 8 / 25, protocolRevenueRatio: 8 / 25, allowReadPairs: true },
+  },
 }
 
 const optionsMap: Record<string, any> = {
@@ -886,12 +1222,40 @@ const optionsMap: Record<string, any> = {
 }
 
 const methodologyMap: Record<string, any> = {
+  "fstswap": {
+    Volume: "Swap volume from all FstSwap V2 pairs deployed by the FstSwap factory on BNB Smart Chain.",
+  },
+  "bitblocks-finance-v2": {
+    Volume: 'Volume is derived from Swap events emitted by BitBlocks Finance V2 pairs on BNB Smart Chain.',
+    Fees: 'Traders pay a 0.25% fee on every V2 swap.',
+    UserFees: 'Users pay the full 0.25% swap fee charged by V2 pairs.',
+    Revenue: '32% of V2 swap fees go to the protocol while feeTo is enabled on the factory.',
+    ProtocolRevenue: '32% of V2 swap fees accrue to the protocol through LP token minting while feeTo is enabled.',
+    SupplySideRevenue: 'Liquidity providers receive V2 swap fees minus the protocol share.',
+  },
   "bdex-v2": {
     Volume: "Swap volume from all BDEX V2 pools deployed via the V2 factory on BOT Chain.",
     Fees: "Users pay a 0.3% fee on every swap.",
     Revenue: "No protocol fee is taken (factory feeTo is unset), all swap fees go to liquidity providers.",
     ProtocolRevenue: "No protocol fee is taken.",
     SupplySideRevenue: "100% of swap fees are distributed to liquidity providers.",
+  },
+  "somnex-xyz": {
+    Volume: "Swap volume from all Somnex V2 pairs deployed by the Somnex V2 factory on Somnia.",
+    Fees: "Users pay a 0.5% fee on every swap.",
+  },
+  "reddex": {
+    Volume: "Swap volume from all Reddex pairs deployed by the Reddex factory on Redbelly.",
+    Fees: "User pays 0.3% fees on each swap.",
+    UserFees: "User pays 0.3% fees on each swap.",
+    Revenue: "Protocol takes 25% of the 0.3% swap fee (0.075% of volume), minted to feeTo on each liquidity event.",
+    ProtocolRevenue: "Protocol takes 25% of the 0.3% swap fee (0.075% of volume).",
+    SupplySideRevenue: "Liquidity providers keep 75% of the 0.3% swap fee (0.225% of volume).",
+    HoldersRevenue: "Token holders receive no revenue.",
+  },
+  "tealswap": {
+    Volume: "Swap volume from all Tealswap V2 pairs deployed by the Tealswap factory on Oasys.",
+    Fees: "Users pay a 0.5% fee on every swap.",
   },
   "melegaswap": {
     Volume: 'Swap volume from MelegaSwap V2 liquidity pairs on BNB Smart Chain.',
@@ -900,14 +1264,6 @@ const methodologyMap: Record<string, any> = {
     Revenue: 'The factory fee recipient is disabled, so the protocol receives no swap-fee revenue.',
     ProtocolRevenue: 'The factory fee recipient is disabled, so protocol revenue is zero.',
     SupplySideRevenue: 'Swap fees accrue to liquidity providers.',
-  },
-  "sonevibe": {
-    Volume: "Volume is calculated from Swap events on VibeSwap pairs created by the VibeFactory.",
-    Fees: "Each swap pays a 0.25% fee.",
-    UserFees: "Users pay a 0.25% fee on each swap.",
-    Revenue: "1/6 of swap fees (~0.0417%) accrue to the protocol via the factory feeTo LP mint.",
-    ProtocolRevenue: "1/6 of swap fees (~0.0417%) go to the protocol feeTo address.",
-    SupplySideRevenue: "5/6 of swap fees (~0.2083%) go to liquidity providers.",
   },
   "ebisus-bay-dex": {
     Volume: "Trading volume on the Cronos Ebisus Bay DEX, measured from one token side of each pool swap using the shared Uniswap V2 liquidity filters; excludes NFT trades.",
@@ -1283,6 +1639,67 @@ const methodologyMap: Record<string, any> = {
     SupplySideRevenue: 'All user fees are distributed among LPs.',
     HoldersRevenue: 'Holders have no revenue.',
   },
+  "beamswap-classic": {
+    UserFees: "User pays 0.30% fees on each swap.",
+    Fees: "A 0.30% of each swap is collected as trading fees",
+    Revenue: "Protocol receives 0.13% on each swap.",
+    ProtocolRevenue: "Protocol receives 0.13% on each swap.",
+    SupplySideRevenue: "All user fees are distributed among LPs.",
+    HoldersRevenue: "Stakers received $GLINT in staking rewards.",
+  },
+  "baseswap-v2": {
+    Fees: "Traders pay a 0.25% fee on every swap in BaseSwap V2 pairs.",
+    UserFees: "All fees are the 0.25% swap fee paid by traders.",
+    Revenue: "32% of swap fees (0.08% of volume) go to the BaseSwap protocol.",
+    ProtocolRevenue: "The full 32% protocol share is collected by the BaseSwap treasury multisig.",
+    SupplySideRevenue: "68% of swap fees (0.17% of volume) stay in the pools for liquidity providers.",
+    HoldersRevenue: "No fixed share of swap fees is distributed to BSX/xBSX holders.",
+  },
+  "swapbased-v2": {
+    UserFees: "User pays 0.30% fees on each swap.",
+    SupplySideRevenue: "LPs receive 0.25% of each swap.",
+    ProtocolRevenue: "Treasury receives 0.05% of each swap.",
+    Revenue: "All revenue generated comes from user fees.",
+    Fees: "All fees come from the user.",
+  },
+  "dragonswap-v2": {
+    UserFees: "User pays 0.3% fees on each swap.",
+    ProtocolRevenue: "Treasury receives 0.06% of each swap.",
+    SupplySideRevenue: "LPs receive 0.24% of the fees.",
+    Revenue: "All revenue generated comes from user fees.",
+    Fees: "All fees comes from the user."
+  },
+  "metropolis-amm": {
+    Fees: "0.3% of the trading volume",
+    Revenue: "40% of the swap fees",
+    ProtocolRevenue: "10% of the swap fees",
+    SupplySideRevenue: "60% of the swap fees",
+    HoldersRevenue: "30% of the swap fees",
+  },
+  "potatoswap": {
+    Fees: "PotatoSwap charges a 0.25% swap fee on v2 pools.",
+    UserFees: "Users pay a 0.25% swap fee per trade.",
+    Revenue: "0.08% of swap volume (the non-LP share) is distributed to vePOT holders.",
+    SupplySideRevenue: "Liquidity providers receive 0.17% of swap volume.",
+    HoldersRevenue: "0.08% of swap volume is distributed to vePOT holders.",
+    ProtocolRevenue: "The protocol does not retain a direct fee share.",
+  },
+  "wigoswap": {
+    Fees: "0.19% swap fee paid by traders.",
+    UserFees: "Users pay a 0.19% fee on each swap.",
+    Revenue: "0.01% of swap volume is distributed to WIGO stakers.",
+    ProtocolRevenue: "The protocol keeps no share of swap fees.",
+    HoldersRevenue: "0.01% of swap volume is distributed to WIGO stakers.",
+    SupplySideRevenue: "0.18% of swap volume goes to liquidity providers.",
+  },
+  "vapordex-v1": {
+    Fees: "0.29% swap fee, hardcoded in the pair contract.",
+    UserFees: "Users pay a 0.29% fee on each swap.",
+    Revenue: "The protocol takes no share of swap fees.",
+    ProtocolRevenue: "The protocol takes no share of swap fees.",
+    SupplySideRevenue: "All swap fees go to liquidity providers.",
+    HoldersRevenue: "Holders have no revenue.",
+  },
 }
 
 const deadFromMap: Record<string, string> = {
@@ -1298,6 +1715,9 @@ const deadFromMap: Record<string, string> = {
   "zircon-gamma": '2023-03-26',
   "velocimeter-v2": "2026-05-17",
   "astroswap": "2023-08-06",
+  "jswap": '2023-03-03',
+  "okcswap": '2025-10-22',
+  "bcswap": '2026-10-27',
 }
 
 // Fees-specific configs (same protocol name may have different config for fees vs dexs)
@@ -1490,15 +1910,6 @@ const subgraphConfigs: Record<string, SubgraphProtocolConfig> = {
     },
     start: '2022-09-15',
   },
-  "aktionariat": {
-    endpoints: {
-      [CHAIN.ETHEREUM]: sdk.graph.modifyEndpoint('2ZoJCp4S7YP7gbYN2ndsYNjPeZBV1PMti7BBoPRRscNq'),
-      [CHAIN.OPTIMISM]: sdk.graph.modifyEndpoint('3QfEXbPfP23o3AUzcmjTfRtUUd4bfrFj3cJ4jET57CTX'),
-      [CHAIN.POLYGON]: sdk.graph.modifyEndpoint('7camBLZckE5TLKha372tqawpDs8Lkez6yYiri7PykRak'),
-    },
-    factoriesName: "registries",
-    totalVolume: "totalVolumeUSD",
-  },
   "canary": {
     endpoints: {
       [CHAIN.AVAX]: sdk.graph.modifyEndpoint('An3x5Mz4YXEERomXYC4AhGgNhRthPFXNYDnrMCjrAJe'),
@@ -1566,12 +1977,16 @@ const subgraphConfigs: Record<string, SubgraphProtocolConfig> = {
     factoriesName: "factories",
     totalVolume: "totalVolumeUSD",
     start: '2024-01-30',
+    // MAP chain halted at block 26852733 (2026-10-31 10:32 UTC), all RPCs down; last swap 2026-10-21, under $1k/month since July 2026
+    deadFrom: '2026-10-31',
   },
   "hiveswap": {
     endpoints: {
       [CHAIN.MAP]: "https://makalu-graph.maplabs.io/subgraphs/name/map/hiveswap2",
     },
     start: '2022-07-16',
+    // MAP chain halted at block 26852733 (2026-10-31 10:32 UTC), all RPCs down; last swap 2026-10-21, under $1k/month since July 2026
+    deadFrom: '2026-10-31',
   },
   "levinswap": {
     endpoints: {
@@ -1813,20 +2228,29 @@ protocols['bdex-v2'].breakdownMethodology = {
   SupplySideRevenue: { 'LP fees': methodologyMap['bdex-v2'].SupplySideRevenue },
 }
 
+protocols['baseswap-v2'].breakdownMethodology = {
+  Fees: { 'Token Swap Fees': "0.25% swap fee paid by traders on BaseSwap V2 pairs." },
+  UserFees: { 'Trading fees': "0.25% swap fee paid by traders per trade." },
+  Revenue: { 'Protocol fees': "32% of swap fees (0.08% of volume) going to the BaseSwap protocol." },
+  ProtocolRevenue: { 'Protocol fees': "32% of swap fees (0.08% of volume) collected by the BaseSwap treasury multisig." },
+  SupplySideRevenue: { 'LP fees': "68% of swap fees (0.17% of volume) kept by liquidity providers." },
+  HoldersRevenue: { 'Tokenholder fees': "No fixed share of swap fees goes to BSX/xBSX holders." },
+}
+
+protocols['potatoswap'].breakdownMethodology = {
+  Fees: { 'Token Swap Fees': "0.25% swap fee paid by users on PotatoSwap v2 pools." },
+  UserFees: { 'Trading fees': "0.25% swap fee paid by users per trade." },
+  Revenue: { 'Protocol fees': "0.08% of swap volume (non-LP share) going to vePOT holders." },
+  SupplySideRevenue: { 'LP fees': "0.17% of swap volume distributed to liquidity providers." },
+  HoldersRevenue: { 'Tokenholder fees': "0.08% of swap volume distributed to vePOT holders." },
+}
+
 protocols['melegaswap'].breakdownMethodology = {
   Fees: { 'Token Swap Fees': 'The 0.3% fee charged on each token swap.' },
   UserFees: { 'Trading fees': 'The full 0.3% swap fee paid by users.' },
   Revenue: { 'Protocol fees': 'Protocol-retained swap fees; zero while the factory fee recipient is disabled.' },
   ProtocolRevenue: { 'Protocol fees': 'Protocol-retained swap fees; zero while the factory fee recipient is disabled.' },
   SupplySideRevenue: { 'LP fees': 'Swap fees accruing to liquidity providers.' },
-}
-
-protocols['sonevibe'].breakdownMethodology = {
-  Fees: { 'Token Swap Fees': methodologyMap['sonevibe'].Fees },
-  UserFees: { 'Trading fees': methodologyMap['sonevibe'].UserFees },
-  Revenue: { 'Protocol fees': methodologyMap['sonevibe'].Revenue },
-  ProtocolRevenue: { 'Protocol fees': methodologyMap['sonevibe'].ProtocolRevenue },
-  SupplySideRevenue: { 'LP fees': methodologyMap['sonevibe'].SupplySideRevenue },
 }
 
 // RH has no referral program: Pair._update0/_update1 send MAX_REFERRAL_FEE to the treasury in dibs.
@@ -1848,6 +2272,66 @@ protocols['hybra-v2'].adapter[CHAIN.ROBINHOOD].fetch = async (options: FetchOpti
     ...config, fees: Number(volatileFee) / 10000, stableFees: Number(stableFee) / 10000,
     revenueRatio, protocolRevenueRatio: revenueRatio,
   })(options)
+}
+
+protocols['somnex-xyz'].breakdownMethodology = {
+  Fees: { 'Token Swap Fees': methodologyMap['somnex-xyz'].Fees },
+}
+protocols['somnex-xyz'].adapter[CHAIN.SOMNIA].fetch = async (options: FetchOptions) =>
+  getUniV2LogAdapter(configs['somnex-xyz'][CHAIN.SOMNIA])({ ...options, getLogs: getLogsSplitAtCap(options) })
+
+protocols['reddex'].breakdownMethodology = {
+  Fees: { 'Token Swap Fees': methodologyMap['reddex'].Fees },
+  UserFees: { 'Trading fees': methodologyMap['reddex'].UserFees },
+  Revenue: { 'Protocol fees': methodologyMap['reddex'].Revenue },
+  ProtocolRevenue: { 'Protocol fees': methodologyMap['reddex'].ProtocolRevenue },
+  SupplySideRevenue: { 'LP fees': methodologyMap['reddex'].SupplySideRevenue },
+  HoldersRevenue: { 'Tokenholder fees': methodologyMap['reddex'].HoldersRevenue },
+}
+protocols['reddex'].adapter[CHAIN.REDBELLY].fetch = async (options: FetchOptions) =>
+  getUniV2LogAdapter(configs['reddex'][CHAIN.REDBELLY])({
+    ...options,
+    getLogs: async ({ targets, flatten = true, ...params }: any) => {
+      const results = []
+      for (const target of targets) results.push(await options.getLogs({ ...params, target, maxBlockRange: 80 }))
+      return flatten ? results.flat() : results
+    },
+  })
+
+// ENI RPCs allow about 10 eth_getLogs per 10 s per IP, shared across hosts, so one call per pool (~42 per hourly
+// window) 429s. They also answer a range with only the logs of its first 2,000 blocks and no error (a 3,500-block
+// hourly window lost about half its swaps). Instead, scan the window once by Swap topic in 1,800-block chunks
+// (the SDK pads each with 10 blocks per side) and hand each pair its own logs. In a 4,000-block sample (2026-11-08)
+// only 8 contracts emitted this Swap topic chain-wide, so the scan returns little beyond the factory's pairs.
+const ENI_LOG_CHUNK_BLOCKS = 1800
+protocols['daoaas-swap'].adapter[CHAIN.ENI].fetch = async (options: FetchOptions) =>
+  getUniV2LogAdapter(configs['daoaas-swap'][CHAIN.ENI])({
+    ...options,
+    getLogs: async ({ targets, flatten = true, onlyArgs = true, ...params }: any) => {
+      const logs = await options.getLogs({ ...params, noTarget: true, onlyArgs: false, maxBlockRange: ENI_LOG_CHUNK_BLOCKS })
+      const byPair: Record<string, any[]> = {}
+      for (const log of logs) (byPair[log.address.toLowerCase()] ??= []).push(onlyArgs ? log.args : log)
+      const results = targets.map((pair: string) => byPair[pair.toLowerCase()] ?? [])
+      return flatten ? results.flat() : results
+    },
+  })
+
+protocols['tealswap'].breakdownMethodology = {
+  Fees: { 'Token Swap Fees': methodologyMap['tealswap'].Fees },
+}
+
+protocols['bitblocks-finance-v2'].breakdownMethodology = {
+  Fees: { 'Token Swap Fees': 'Trading fees paid by users on V2 swaps.' },
+  UserFees: { 'Trading fees': 'The full trading fee paid by swap users.' },
+  Revenue: { 'Protocol fees': 'The portion of swap fees accruing to the protocol.' },
+  ProtocolRevenue: { 'Protocol fees': 'Swap fees controlled by the BitBlocks Finance protocol.' },
+  SupplySideRevenue: { 'LP fees': 'The portion of swap fees accruing to liquidity providers.' },
+}
+protocols['bitblocks-finance-v2'].adapter[CHAIN.BSC].fetch = async (options: FetchOptions) => {
+  const config = configs['bitblocks-finance-v2'][CHAIN.BSC]
+  const feeTo: string = await options.api.call({ target: config.factory, abi: 'address:feeTo' })
+  const revenueRatio = feeTo && feeTo.toLowerCase() !== ADDRESSES.null ? config.revenueRatio : 0
+  return getUniV2LogAdapter({ ...config, revenueRatio, protocolRevenueRatio: revenueRatio })(options)
 }
 
 export const { protocolList, getAdapter } = createFactoryExports(protocols)

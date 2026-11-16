@@ -1,9 +1,12 @@
+// Changes to this adapter's revenue methodology require further approval before merging:
+// a Trueo market depends on this data.
+
 import { CHAIN } from "../helpers/chains";
 import { FetchOptions, FetchV2, SimpleAdapter } from "../adapters/types";
 import { addOneToken } from "../helpers/prices";
 import { queryDune } from "../helpers/dune";
 import { httpPost } from "../utils/fetchURL";
-import { DUNE_DEX_BLACKLIST_TABLE } from "../helpers/lists";
+import { DUNE_DEX_BLACKLIST_TABLE, getDexTokensBlacklisted } from "../helpers/lists";
 import {
   getEstablishedTokens, getUniV3LogAdapter, washDayStart, WASH_DUST_USD, WASH_MIN_TRADES,
   WASH_MIN_USD, WASH_TRADES_PER_EOA, WASH_USD_MIN_TRADES_PER_EOA, WASH_USD_PER_EOA,
@@ -32,6 +35,8 @@ const HOLDERS_REVENUE_CONFIG: Record<string, { feeSwitchDate: string | null; fir
   [CHAIN.POLYGON]: { feeSwitchDate: "2026-06-02", firepit: '0xa59FfbB55D91Fc32b44A06F0b9cc6036a4afbcE2' },
   [CHAIN.ROBINHOOD]: { feeSwitchDate: "2026-07-27", firepit: '0x7A8F74C2585F84C781F951B7F2FF21337D5B630B' },
   [CHAIN.UNICHAIN]: { feeSwitchDate: "2026-01-09", firepit: '0xe0A780E9105aC10Ee304448224Eb4A2b11A77eeB' },
+  // Releaser from github.com/Uniswap/protocol-fees .records/Arc.json; fee switch relayed 2026-10-05 (tx 0x2d42e5e9...5c49), first Released 2026-10-18
+  [CHAIN.ARC]: { feeSwitchDate: "2026-10-05", firepit: '0xe1Adf3f130Abf616a7aB04AEeBf8D0470F6B6a16' },
 }
 
 const THRESHOLD_FUNCTION_ABI = 'uint256:threshold'
@@ -256,6 +261,9 @@ const factoryConfig: Record<string, string> ={
   [CHAIN.SCROLL]: "0x70C62C8b8e801124A4Aa81ce07b637A3e83cb919",
   [CHAIN.BLAST]: "0x792edAdE80af5fC680d96a2eD80A44247D2Cf6Fd",
   [CHAIN.ARC]: "0xf0db7b58379503491d857db50ac9ece64c653918",
+  // https://gov.uniswap.org/t/official-uniswap-v3-deployments-list/24323/9
+  [CHAIN.ETHERLINK]: "0xcb2436774C3e191c85056d248EF4260ce5f27A9D",
+  [CHAIN.ELYSIUM]: "0x1707327F626496A7b5b3872e7E4d2879Df7d7a9f",
 }
 
 async function fetchFromLogs(options: FetchOptions) {
@@ -269,6 +277,8 @@ async function fetchFromLogs(options: FetchOptions) {
     userFeesRatio: 1,
     revenueRatio: 0,
     protocolRevenueRatio: 0,
+    // same shared scam/fake-token list the Dune path applies in-query
+    blacklistTokens: await getDexTokensBlacklisted(options),
   })(options);
 
   const dailyHoldersRevenue = await fetchHoldersRevenue(options);
@@ -329,22 +339,24 @@ const chainConfig: Record<string, { blockchain: string; start: string; fetch: Fe
   [CHAIN.SAGA]: { blockchain: 'saga', start: '2025-02-11', fetch: fetchFromOku },
   [CHAIN.XDC]: { blockchain: 'xdc', start: '2025-04-12', fetch: fetchFromOku },
   [CHAIN.NIBIRU]: { blockchain: 'nibiru', start: '2025-05-12', fetch: fetchFromOku },
-  [CHAIN.ETHERLINK]: { blockchain: 'etherlink', start: '2025-05-12', fetch: fetchFromOku },
   [CHAIN.REDBELLY]: { blockchain: 'redbelly', start: '2025-02-19', fetch: fetchFromOku },
 
   // On-chain logs (no Dune dex.trades or Oku API coverage)
   [CHAIN.OG]: { blockchain: '0g', start: '2025-09-24', fetch: fetchFromLogs },
+  // Oku stopped returning etherlink after 2026-09-22 while the pools kept trading, so the whole range reads the pools
+  [CHAIN.ETHERLINK]: { blockchain: 'etherlink', start: '2025-05-12', fetch: fetchFromLogs },
   [CHAIN.ARC]: { blockchain: 'arc', start: '2026-05-28', fetch: fetchFromLogs },
+  [CHAIN.ELYSIUM]: { blockchain: 'elysium', start: '2026-11-03', fetch: fetchFromLogs },
 }
 
 const methodology = {
   Volume: "Swap volume, excluding wash trading: pools whose daily trades come from too few distinct addresses to be organic, unless every pool token is a core asset or CoinGecko-listed.",
   Fees: "Swap fees from paid by users.",
   UserFees: "User pays fees on each swap.",
-  Revenue: 'From 28 Dec 2025, a portion of fees a collected to buy back and burn UNI on Ethereum, From 8 Mar 2026, on Optimism, Arbitrum, Base, WC, Zora, XLayer, From 2 Jun 2026, on Polygon, BSC, Celo, From 27 Jul 2026, on Robinhood',
+  Revenue: 'From 28 Dec 2025, a portion of fees a collected to buy back and burn UNI on Ethereum, From 8 Mar 2026, on Optimism, Arbitrum, Base, WC, Zora, XLayer, From 2 Jun 2026, on Polygon, BSC, Celo, From 27 Jul 2026, on Robinhood, From 5 Oct 2026, on Arc',
   ProtocolRevenue: 'Protocol make no revenue.',
   SupplySideRevenue: 'Fees distributed to LPs post protocol fee collection',
-  HoldersRevenue: 'From 28 Dec 2025, a portion of fees a collected to buy back and burn UNI on Ethereum, From 8 Mar 2026, on Optimism, Arbitrum, Base, WC, Zora, XLayer, From 2 Jun 2026, on Polygon, BSC, Celo, From 27 Jul 2026, on Robinhood',
+  HoldersRevenue: 'From 28 Dec 2025, a portion of fees a collected to buy back and burn UNI on Ethereum, From 8 Mar 2026, on Optimism, Arbitrum, Base, WC, Zora, XLayer, From 2 Jun 2026, on Polygon, BSC, Celo, From 27 Jul 2026, on Robinhood, From 5 Oct 2026, on Arc',
 }
 
 const adapter: SimpleAdapter = {

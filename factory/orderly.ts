@@ -184,7 +184,27 @@ const feesConfigs: Record<string, Config> = {
       Revenue: "All the fees collected",
       ProtocolRevenue: "All the revenue goes to the protocol",
     },
-  }
+  },
+  "orbitdex": {
+    broker_id: "orbit",
+    start: "2026-08-03",
+    methodology: {
+      Volume: "Maker/taker volume that flows through the OrbitDEX interface",
+      Fees: "Builder Fees collected from Orderly Network",
+      Revenue: "All the fees collected",
+      ProtocolRevenue: "All the revenue goes to the protocol",
+    },
+  },
+  "nexwest": {
+    broker_id: "nexwest",
+    start: "2026-11-14",
+    methodology: {
+      Volume: "Maker/taker volume that flows through the Nexwest interface",
+      Fees: "Builder Fees collected from Orderly Network",
+      Revenue: "All the fees collected",
+      ProtocolRevenue: "All the revenue goes to the protocol",
+    },
+  },
 }
 
 const feesProtocols: Record<string, any> = {};

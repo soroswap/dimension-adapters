@@ -1,3 +1,6 @@
+// Changes to this adapter's revenue methodology require further approval before merging:
+// a Trueo market depends on this data.
+
 import { CHAIN } from "../helpers/chains";
 import { Adapter, FetchOptions, FetchResultV2 } from "../adapters/types";
 import { getUniV2LogAdapter } from "../helpers/uniswap";
@@ -103,6 +106,11 @@ const chainConfig: Record<string, {
     factory: '0x89e5db8b5aa49aa85ac63f691524311aeb649eba',
     source: 'LOGS',
     start: '2026-05-28',
+  },
+  [CHAIN.ELYSIUM]: {
+    factory: '0xBbBcC62853a5fA27b93d6Bab3E6F7ce841E25Df2',
+    source: 'LOGS',
+    start: '2026-11-03',
   },
 }
 

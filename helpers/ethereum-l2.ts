@@ -1,3 +1,4 @@
+import * as sdk from "@defillama/sdk";
 import ADDRESSES from './coreAssets.json'
 import { Adapter, Dependencies, FetchOptions, ProtocolType } from "../adapters/types";
 import { queryDuneSql } from "../helpers/dune";
@@ -35,6 +36,34 @@ export async function getFees(options: FetchOptions, { feeVaults, gasToken, with
   balances.addBalances(api.getBalancesV2())
   balances.subtract(fromApi.getBalancesV2())
   return balances
+}
+
+// Same total as getFees without Withdrawal logs, for chains whose RPC rejects useful getLogs ranges:
+// every OP-stack FeeVault keeps totalProcessed(), the running sum of its withdrawals, so the fees the
+// vaults accrued are the change in balance + totalProcessed. Needs archive state only. The opening
+// state is read at the block before getFromBlock() (the previous window's last block) so hourly
+// windows tile without gaps. `CGToken` prices the gas token when the sdk has no mapping for the chain.
+export async function getFeesFromVaultCounters(options: FetchOptions, { feeVaults, CGToken }: { feeVaults: string[], CGToken?: string }) {
+  const accrued = await getVaultCountersAccruedWei(options, feeVaults)
+  const balances = options.createBalances()
+  if (CGToken) balances.addCGToken(CGToken, Number(accrued) / 1e18)
+  else balances.addGasToken(accrued.toString())
+  return balances
+}
+
+async function getVaultCountersAccruedWei(options: FetchOptions, feeVaults: string[]): Promise<bigint> {
+  const { chain } = options
+  const accruedAt = async (block: number) => {
+    const { output: vaultBalances } = await sdk.api2.eth.getBalances({ targets: feeVaults, chain, block })
+    const processed = await sdk.api2.abi.multiCall({ abi: 'uint256:totalProcessed', calls: feeVaults, chain, block })
+    return [...vaultBalances.map((b: any) => b.balance), ...processed].reduce((sum: bigint, value: any) => sum + BigInt(value), 0n)
+  }
+  const fromBlock = (await options.getFromBlock()) - 1
+  const toBlock = await options.getToBlock()
+  const accrued = (await accruedAt(toBlock)) - (await accruedAt(fromBlock))
+  // balance + totalProcessed never decreases, a negative delta means a bad block lookup
+  if (accrued < 0n) throw new Error(`${chain}: fee vault counters went down between blocks ${fromBlock} and ${toBlock}`)
+  return accrued
 }
 
 export function L2FeesFetcher({
@@ -130,6 +159,12 @@ const INDEXER_SUPPORTED_CHAINS = new Set<string>([
 	CHAIN.XLAYER, // 196
 ]);
 
+// OP-stack rollups that dropped out of Dune's `gas.fees`: their L2 fees come from the fee vault counters
+// (getVaultCountersAccruedWei) on the chain's own archive RPC, and only the L1 cost stays on Dune.
+const FEE_VAULT_CHAINS = new Set<string>([
+	CHAIN.ZORA,
+]);
+
 // L2 transaction fee sum from indexer v2: gas_used * effective_gas_price per
 // tx. Direct replacement for Dune's `SUM(tx_fee) FROM gas.fees` — Dune's
 // `gas.fees` Spellbook is essentially this same multiplication, just
@@ -145,11 +180,28 @@ const SQL_L2_FEES = `
 
 type L2FeesRow = Row & { l2_fees_wei: string };
 
+// L2 fees of the window from the indexer, null when the window has no block past the 50-block reorg margin yet
+export const getIndexerL2FeesWei = async (options: FetchOptions, chainName: string = options.chain): Promise<bigint | null> => {
+	const fromBlock = Number(options.fromApi.block);
+	const safeBlock = Number(options.toApi.block) - 50;
+	if (safeBlock <= fromBlock) return null;
+
+	const l2FeesRows = await queryClickhouse<L2FeesRow>(SQL_L2_FEES, {
+		chain: Number(options.api.chainId),
+		fromBlock,
+		toBlock: safeBlock,
+	});
+	if (!l2FeesRows?.length || l2FeesRows[0]?.l2_fees_wei == null)
+		throw new Error(`${chainName}: the indexer returned no row for this window, refusing to report it as zero fees`);
+	return BigInt(l2FeesRows[0].l2_fees_wei);
+};
+
 // Small Dune query for L1 costs only - scans the tiny pre-aggregated
 // `rollup_economics_ethereum.l1_fees` Spellbook table (~1 row per rollup per
 // day). Negligible scan cost compared to the original `gas.fees` query.
-const buildL1FeesDuneQuery = (rollupName: string, fromTs: number, toTs: number) => `
+export const buildL1FeesDuneQuery = (rollupName: string, fromTs: number, toTs: number) => `
   SELECT
+    COUNT(*) AS l1_rows,
     COALESCE(SUM(data_fee_native), 0) AS l1_calldata_native,
     COALESCE(SUM(blob_fee_native), 0) AS l1_blob_native,
     COALESCE(SUM(verification_fee_native), 0) AS l1_verify_native
@@ -167,30 +219,18 @@ export const fetchL2FeesWithDune = async (options: FetchOptions, chain_name?: st
 	// L2 fees from ClickHouse; L1 calldata/blob/verification still from Dune
 	// but via a tiny Spellbook-only query (no `gas.fees` scan).
 	if (INDEXER_SUPPORTED_CHAINS.has(options.chain) && rollupName) {
-		const fromBlock = Number(options.fromApi.block);
-		const safeBlock = Number(options.toApi.block) - 50;
-
 		const dailyFees = options.createBalances();
 		const dailyRevenue = options.createBalances();
 
-		if (safeBlock <= fromBlock) {
-			return { dailyFees, dailyRevenue };
-		}
-
-		const [l2FeesRows, l1FeesRows] = await Promise.all([
-			queryClickhouse<L2FeesRow>(SQL_L2_FEES, {
-				chain: Number(options.api.chainId),
-				fromBlock,
-				toBlock: safeBlock,
-			}),
+		const [l2FeesWei, l1FeesRows] = await Promise.all([
+			getIndexerL2FeesWei(options, chainName),
 			queryDuneSql(options, buildL1FeesDuneQuery(rollupName, options.startTimestamp, options.endTimestamp)) as Promise<any[]>,
 		]);
 
-		// same distinction as the fallback below: no row back is a failed read, not a free chain
-		if (!l2FeesRows?.length || l2FeesRows[0]?.l2_fees_wei == null)
-			throw new Error(`${chainName}: the indexer returned no row for this window, refusing to report it as zero fees`);
+		if (l2FeesWei === null) {
+			return { dailyFees, dailyRevenue };
+		}
 
-		const l2FeesWei = BigInt(l2FeesRows[0].l2_fees_wei);
 		const l1Calldata = Number(l1FeesRows?.[0]?.l1_calldata_native) || 0;
 		const l1Blob     = Number(l1FeesRows?.[0]?.l1_blob_native)     || 0;
 		const l1Verify   = Number(l1FeesRows?.[0]?.l1_verify_native)   || 0;
@@ -208,13 +248,38 @@ export const fetchL2FeesWithDune = async (options: FetchOptions, chain_name?: st
 		return { dailyFees, dailyRevenue };
 	}
 
+	// --- Path B for FEE_VAULT_CHAINS: L2 fees from the fee vaults over RPC, L1 cost from the same small
+	// Spellbook query as Path A. ---
+	if (FEE_VAULT_CHAINS.has(options.chain) && rollupName) {
+		const l2FeesWei = await getVaultCountersAccruedWei(options, [feeWallet, l1FeeVault, baseFeeVault]);
+		const dailyFees = options.createBalances();
+		dailyFees.addGasToken(l2FeesWei.toString(), METRIC.TRANSACTION_GAS_FEES);
+
+		// the L1 cost only corrects revenue: when the lookup fails, publish the fees and leave revenue out
+		let l1FeesRows: any[];
+		try {
+			l1FeesRows = await queryDuneSql(options, buildL1FeesDuneQuery(rollupName, options.startTimestamp, options.endTimestamp));
+		} catch (e) {
+			console.error(`${chainName}: L1 cost lookup failed, publishing fees without revenue`, e);
+			return { dailyFees };
+		}
+		// a rollup that posts batches always has an L1 cost row, so none means rollup_economics has not caught up yet
+		if (!Number(l1FeesRows?.[0]?.l1_rows))
+			throw new Error(`${chainName}: rollup_economics_ethereum.l1_fees has no row for this window yet, not reporting revenue without the L1 cost`);
+
+		const l1TotalEth = Number(l1FeesRows[0].l1_calldata_native) + Number(l1FeesRows[0].l1_blob_native) + Number(l1FeesRows[0].l1_verify_native);
+		const dailyRevenue = options.createBalances();
+		dailyRevenue.addGasToken((l2FeesWei - BigInt(Math.round(l1TotalEth * 1e18))).toString(), METRIC.TRANSACTION_GAS_FEES);
+		return { dailyFees, dailyRevenue };
+	}
+
 	const DUNE_LAG_HOURS: Record<string, number> = { [CHAIN.ABSTRACT]: 24 };
 	const lagHours = DUNE_LAG_HOURS[options.chain];
 	if (lagHours && Date.now() / 1000 < options.endTimestamp + lagHours * 3600)
 		throw new Error(`${chainName}: gas.fees lands ~${lagHours}h late on Dune, not querying a window that ended less than ${lagHours}h ago`);
 
 	// --- Fallback: chains not in evm_indexer (abstract, boba, mantle,
-	// zora-chain, manta, lyra, starknet, ...). Keeps the original Dune-only
+	// manta, lyra, starknet, ...). Keeps the original Dune-only
 	// behavior verbatim. Heavier than the hybrid path but covers chains the
 	// indexer doesn't index. ---
 	const query = `WITH
@@ -253,6 +318,10 @@ export const fetchL2FeesWithDune = async (options: FetchOptions, chain_name?: st
 				COALESCE((SELECT l1_blob_cost FROM l1_fees_cte), 0) +
 				COALESCE((SELECT l1_verify_cost FROM l1_fees_cte), 0))
 			) AS total_revenue,
+			(COALESCE((SELECT l1_calldata_cost FROM l1_fees_cte), 0) +
+				COALESCE((SELECT l1_blob_cost FROM l1_fees_cte), 0) +
+				COALESCE((SELECT l1_verify_cost FROM l1_fees_cte), 0)
+			) AS l1_cost_eth,
 			COALESCE((SELECT l2_fees_usd FROM l2_fees_cte), 0) AS total_fee_usd,
 			(COALESCE((SELECT l2_fees_usd FROM l2_fees_cte), 0) - (
 				COALESCE((SELECT l1_calldata_cost_usd FROM l1_fees_cte), 0) +
@@ -277,7 +346,14 @@ export const fetchL2FeesWithDune = async (options: FetchOptions, chain_name?: st
 	const dailyRevenue = options.createBalances();
 
 	dailyFees.addGasToken(feesResult[0].total_fee * 1e18, METRIC.TRANSACTION_GAS_FEES); // all from above list has 18 decimals
-	dailyRevenue.addGasToken(feesResult[0].total_revenue * 1e18, METRIC.TRANSACTION_GAS_FEES); // all from above list has 18 decimals
+	if (options.chain === CHAIN.MANTLE) {
+		// Mantle's fees are in MNT but its L1 costs are in ETH: total_revenue subtracts them as raw numbers,
+		// which prices the ETH cost as MNT, so subtract it as ETH instead.
+		dailyRevenue.addGasToken(feesResult[0].total_fee * 1e18, METRIC.TRANSACTION_GAS_FEES);
+		dailyRevenue.addCGToken('ethereum', -Number(feesResult[0].l1_cost_eth), METRIC.TRANSACTION_GAS_FEES);
+	} else {
+		dailyRevenue.addGasToken(feesResult[0].total_revenue * 1e18, METRIC.TRANSACTION_GAS_FEES); // all from above list has 18 decimals
+	}
 
 	return { dailyFees, dailyRevenue };
 };
@@ -315,12 +391,71 @@ const l2FeesDuneProtocols: Record<string, Adapter> = {
 		Fees: 'Transaction fees paid by users',
 		Revenue: 'Total revenue on Scroll, calculated by subtracting the L1 Batch Costs from the total gas fees',
 	}),
-	'zksync-era': l2FeesDuneAdapter(CHAIN.ERA, '2023-02-14', 'zksync'),
+	// 'zksync-era' lives in fees/zksync-era.ts: its L1 cost comes from Allium since 2026-02-01
 	'zora-chain': l2FeesDuneAdapter(CHAIN.ZORA, '2023-06-13', undefined, {
 		Fees: 'Transaction fees paid by users',
 		Revenue: 'Total revenue on Zora, calculated by subtracting the L1 Batch Costs from the total gas fees',
 	}),
 };
 
-export const protocolList = Object.keys(l2FeesDuneProtocols);
-export const getAdapter = (name: string) => l2FeesDuneProtocols[name];
+// OP-stack chains read from their fee vaults on the L2, with the sequencer's L1 spend (batch inbox
+// or batcher/proposer wallets on Ethereum, via Allium) subtracted from revenue. See L2FeesFetcher.
+type L2FeeVaultConfig = {
+	chain: string;
+	start: string;
+	ethereumWallets: string[];
+	feeVaults?: string[];
+	gasToken?: string;
+	methodology?: Record<string, string>;
+	allowNegativeValue?: boolean;
+};
+
+const l2FeeVaultConfigs: Record<string, L2FeeVaultConfig> = {
+	'ink': {
+		chain: CHAIN.INK, start: '2024-12-20',
+		// batch inbox from the superchain registry (rotation-proof, unlike the genesis batcher EOA
+		// 0x500d7Ea6... this previously pointed at, which stopped submitting and zeroed the revenue metric)
+		ethereumWallets: ['0x005969bf0EcbF6eDB6C47E5e94693b1C3651Be97'],
+		methodology: {
+			Fees: 'Transaction fees paid by users',
+			Revenue: 'Total revenue on Ink, calculated by subtracting the L1 Batch Costs from the total gas fees',
+		},
+	},
+	'manta': {
+		chain: CHAIN.MANTA, start: '2023-09-09',
+		ethereumWallets: ['0x30c789674ad3b458886bbc9abf42eee19ea05c1d', '0xAEbA8e2307A22B6824a9a7a39f8b016C357Cd1Fe'],
+		allowNegativeValue: true, // sequencer fees
+	},
+	'polynomial': {
+		chain: CHAIN.POLYNOMIAL, start: '2024-08-25',
+		ethereumWallets: [
+			'0x0bd57e83B5E0f9eCD84d559bB58e1EcFEEdD2565', // BATCH INBOX (superchain registry; rotation-proof)
+			'0x5DA28F0186051a9F7b9eE2553FFdc165EB0A6714', // PROPOSER (genesis, inactive since rotation)
+			'0x67a44CE38627F46F20b1293960559eD85Dd194F1', // BATCHER (genesis, inactive since rotation)
+		],
+	},
+	'soneium': {
+		chain: CHAIN.SONEIUM, start: '2024-12-29',
+		ethereumWallets: ['0x6776BE80dBAda6A02B5F2095cF13734ac303B8d1'],
+		methodology: {
+			Fees: 'Transaction fees paid by users',
+			Revenue: 'Total revenue on Soneium, calculated by subtracting the L1 Batch Costs from the total gas fees',
+		},
+	},
+};
+
+const l2FeeVaultProtocols: Record<string, Adapter> = {};
+for (const [name, { chain, start, ethereumWallets, feeVaults, gasToken, methodology, allowNegativeValue }] of Object.entries(l2FeeVaultConfigs)) {
+	l2FeeVaultProtocols[name] = {
+		version: 2,
+		adapter: { [chain]: { fetch: L2FeesFetcher({ ethereumWallets, feeVaults, gasToken }), start } },
+		protocolType: ProtocolType.CHAIN,
+		...(methodology ? { methodology } : {}),
+		...(allowNegativeValue ? { allowNegativeValue } : {}),
+	};
+}
+
+const l2FeesProtocols: Record<string, Adapter> = { ...l2FeesDuneProtocols, ...l2FeeVaultProtocols };
+
+export const protocolList = Object.keys(l2FeesProtocols);
+export const getAdapter = (name: string) => l2FeesProtocols[name];

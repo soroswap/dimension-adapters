@@ -1,9 +1,12 @@
 // Use
 export enum CHAIN {
+  KROWN = "krown",
+  THETA = "theta",
   CHAIN_GLOBAL = "chain_global", // for some adapters aggregate data across all chains is not the sum of individual chains, so we need a separate identifier for the aggregate data
   BITCOIN_SV = "bsv",
   PACASWAP = "pacaswap",
   PEAQ = "peaq",
+  PEPU = "pepu",
   PEARL = "pearl",
   CHROMIA = "chromia",
   CITREA = "citrea",
@@ -22,6 +25,7 @@ export enum CHAIN {
   BOBA = "boba",
   BOBA_BNB = "boba_bnb",
   BSC = "bsc",
+  BESC = "besc",
   BIFROST = "bifrost",
   BOTANIX = "btnx",
   BEAM = "beam",
@@ -413,6 +417,7 @@ export enum CHAIN {
   REDBELLY = "rbn",
   MORPH_TACHYON = "morph_tachyon",
   RAYLS = "rls",
+  ELYSIUM = "elysium",
   DYDX = "dydx",
   SECRET = "secret",
   AXELAR = "axelar",
@@ -441,4 +446,5 @@ export enum CHAIN {
   SOMMELIER = "sommelier",
   FETCHHUB = "fetchhub",
   ANUBI = "anubi",
+  DUSK = "dusk",
 }
